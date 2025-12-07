@@ -23,6 +23,14 @@ from x1.bot.utils import Utils
 from x1.bot.utils.Log import Log
 from x1.bot.utils.black_list_symbol import BLACK_LIST_SYMBOL
 
+# ✨ THÊM IMPORT - PnL Tracking
+try:
+    from x1.bot.utils.enhanced_pnl_tracking import integrate_pnl_tracking
+
+    PNL_TRACKING_AVAILABLE = True
+except ImportError:
+    PNL_TRACKING_AVAILABLE = False
+
 
 class MexcPumpBot:
     """
@@ -33,6 +41,10 @@ class MexcPumpBot:
 
         self.db_manager = None
         self.bot_manager = None
+        # ✨ THÊM ATTRIBUTES - PnL Tracking
+        self.enhanced_bot_mgr = None
+        self.enhanced_strat_mgr = None
+
         bot_token = "7519046021:AAER7iFwU2akFBZp111qCyZwBak_2NrT2lw"
         self.admin_proxy = "GPVNx6479:mWBK1h1J@103.145.254.137:27657"
 
@@ -105,6 +117,25 @@ class MexcPumpBot:
                 )
 
                 await self.bot_manager.initialize()
+
+                # ✨ THÊM - INTEGRATE PNL TRACKING
+                if PNL_TRACKING_AVAILABLE:
+                    try:
+                        self.enhanced_bot_mgr, self.enhanced_strat_mgr = integrate_pnl_tracking(
+                            self.bot_manager,
+                            self.strategy_manager,
+                            self.db_manager,
+                            self.log,
+                            self.tele_message,
+                            self.chat_id
+                        )
+
+                        self.strategy_manager.enhanced_manager = self.enhanced_strat_mgr
+                        self.log.i(self.tag, "✅ Enhanced PnL tracking initialized")
+                    except Exception as e:
+                        self.log.w(self.tag, f"⚠️ PnL tracking init failed: {e}")
+                else:
+                    self.log.w(self.tag, "⚠️ PnL tracking not available")
 
                 bot_stats = self.bot_manager.get_stats()
 
@@ -301,6 +332,13 @@ class MexcPumpBot:
             price_change_1m = signal.get('price_change_1m', 0)
             price_change_5m = signal.get('price_change_5m', 0)
             volume_ratio = signal.get('volume_ratio', 0)
+
+            # ✨ THÊM - UPDATE PRICES FOR PNL TRACKING
+            if hasattr(self, 'enhanced_bot_mgr') and self.enhanced_bot_mgr:
+                self.enhanced_bot_mgr.update_price(symbol, price)
+
+            if hasattr(self, 'enhanced_strat_mgr') and self.enhanced_strat_mgr:
+                self.enhanced_strat_mgr.update_price(symbol, price)
 
             self.total_signals_detected += 1
 
