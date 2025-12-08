@@ -1,10 +1,20 @@
+# -*- coding: utf-8 -*-
+"""
+MexcSocket - WebSocket connection với MEXC
+FIXED: Task accumulation, memory leak
+
+Changes:
+1. Await callbacks thay vì create_task vô hạn
+2. Semaphore để limit concurrent processing
+3. Better error handling
+"""
+
 import json
 import traceback
-
-import websockets
 import asyncio
 import time
 
+import websockets
 from websockets_proxy import Proxy, proxy_connect
 
 from x1.bot.model.symbol import Symbol
@@ -23,10 +33,16 @@ class MexcSocket:
         self.tele_message = tele_message
         self.symbols: list[Symbol] = []
         self.ws = None
-        self.callbacks = []  # Danh sách callback
-        self.last_message_time = time.time()  # Lưu thời gian nhận dữ liệu cuối cùng
-        self.monitor_task = None  # Task giám sát timeout
+        self.callbacks = []
+        self.last_message_time = time.time()
+        self.monitor_task = None
         self.chat_id = chat_id
+
+        # ===== PERFORMANCE FIX =====
+        # Semaphore để limit concurrent callback processing
+        self._callback_semaphore = asyncio.Semaphore(10)  # Max 10 concurrent
+        self._pending_tasks: set = set()  # Track pending tasks
+        self._max_pending_tasks = 100  # Max pending tasks before dropping
 
     def register_callback(self, callback):
         """Đăng ký callback để nhận dữ liệu khi giá thay đổi"""
@@ -62,12 +78,15 @@ class MexcSocket:
 
             except websockets.exceptions.ConnectionClosed as e:
                 traceback_str = traceback.format_exc()
-                await self.tele_message.send_message(f"🔴 MEXC WebSocket disconnected: {traceback_str}", self.chat_id)
-                self.log.d("MexcSocket", f"🔴 WebSocket disconnected: {traceback_str}")
+                await self.tele_message.send_message(f"🔴 MEXC WebSocket disconnected: {e}", self.chat_id)
+                self.log.d("MexcSocket", f"🔴 WebSocket disconnected: {e}")
             except Exception as e:
                 traceback_str = traceback.format_exc()
-                await self.tele_message.send_message(f"⚠️ MEXC WebSocket got an unexpected Error: {traceback_str}", self.chat_id)
-                self.log.d("MexcSocket", f"⚠️ Unexpected Error: {traceback_str}")
+                await self.tele_message.send_message(f"⚠️ MEXC WebSocket Error: {e}", self.chat_id)
+                self.log.d("MexcSocket", f"⚠️ Unexpected Error: {e}")
+
+            # Cleanup pending tasks
+            await self._cleanup_pending_tasks()
 
             # Đóng kết nối trước khi reconnect
             if self.ws:
@@ -82,6 +101,16 @@ class MexcSocket:
             await self.tele_message.send_message("🔄 Reconnecting MEXC WebSocket in 5 seconds...", self.chat_id)
             self.log.d("MexcSocket", "🔄 Reconnecting in 5 seconds...")
             await asyncio.sleep(5)
+
+    async def _cleanup_pending_tasks(self):
+        """Cleanup all pending tasks"""
+        try:
+            for task in list(self._pending_tasks):
+                if not task.done():
+                    task.cancel()
+            self._pending_tasks.clear()
+        except Exception as e:
+            self.log.e(self.tag, f"Error cleaning up tasks: {e}")
 
     async def send_ping(self):
         """Gửi ping định kỳ để giữ kết nối sống"""
@@ -108,11 +137,8 @@ class MexcSocket:
         """Lắng nghe dữ liệu từ MEXC"""
         async for message in self.ws:
             try:
-                self.last_message_time = time.time()  # Cập nhật thời gian khi có dữ liệu mới
+                self.last_message_time = time.time()
                 data = json.loads(message)
-
-                # if Constants.DEBUG_LOG:
-                #     self.log.d("MexcSocket", f"📩 Raw market data: {data}\n")
 
                 if data.get("symbol") is None:
                     if constants.DEBUG_LOG:
@@ -129,22 +155,50 @@ class MexcSocket:
                 self.log.d("MexcSocket", f"⚠️ Listen Exception: {traceback_str}")
 
     async def monitor_timeout(self):
-        """Giám sát timeout và tự động reconnect nếu không có dữ liệu sau 60 giây"""
+        """Giám sát timeout và tự động reconnect nếu không có dữ liệu sau 30 giây"""
         while self.ws:
-            await asyncio.sleep(10)  # Kiểm tra mỗi 10 giây
-            if time.time() - self.last_message_time > 30:  # Nếu quá 60 giây không có dữ liệu
-                self.log.d("MexcSocket", "⏳ Timeout: Không có dữ liệu trong 60 giây, reconnecting...")
-                #await send_chat_to_channel("⏳ Timeout: Không có dữ liệu trong 60 giây, reconnecting...")
-                await self.ws.close()  # Đóng WebSocket để `connect()` xử lý reconnect
-                break  # Thoát vòng lặp
+            await asyncio.sleep(10)
+            if time.time() - self.last_message_time > 30:
+                self.log.d("MexcSocket", "⏳ Timeout: Không có dữ liệu trong 30 giây, reconnecting...")
+                await self.ws.close()
+                break
 
-    async def notify(self, symbol, interval, data):
-        for callback in self.callbacks:
-            asyncio.create_task(callback(symbol, interval, data))
-        await asyncio.sleep(0)
+    async def notify(self, symbol: str, interval: str, data: dict):
+        """
+        FIXED: Notify callbacks với rate limiting
+        - Dùng semaphore để limit concurrent processing
+        - Drop nếu quá nhiều pending tasks
+        """
+        try:
+            # Check nếu quá nhiều pending tasks → drop để tránh overload
+            # Cleanup done tasks first
+            done_tasks = {t for t in self._pending_tasks if t.done()}
+            self._pending_tasks -= done_tasks
+
+            if len(self._pending_tasks) >= self._max_pending_tasks:
+                # Drop message để tránh accumulation
+                return
+
+            # Process callbacks với semaphore
+            async def process_callback(callback):
+                async with self._callback_semaphore:
+                    try:
+                        await callback(symbol, interval, data)
+                    except Exception as e:
+                        self.log.e(self.tag, f"Callback error: {e}")
+
+            # Tạo tasks cho callbacks
+            for callback in self.callbacks:
+                task = asyncio.create_task(process_callback(callback))
+                self._pending_tasks.add(task)
+                # Cleanup done task khi complete
+                task.add_done_callback(lambda t: self._pending_tasks.discard(t))
+
+        except Exception as e:
+            self.log.e(self.tag, f"Error in notify: {e}")
 
     async def add_symbols(self, new_symbols):
-        """Đăng ký lắng nghe các cặp giao dịch"""
+        """Đăng ký lắng nghe các cặp giao dịch mới"""
         for symbol in new_symbols:
             subscribe_msg = {
                 "method": "sub.kline",
@@ -157,6 +211,3 @@ class MexcSocket:
             }
             await self.ws.send(json.dumps(subscribe_msg))
             self.log.d("MexcSocket", f"📡 Subscribed to: {symbol.symbol}")
-
-# Tạo một instance của MexcSocket
-

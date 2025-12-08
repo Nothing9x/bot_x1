@@ -1,17 +1,18 @@
+# -*- coding: utf-8 -*-
 """
-StrategyManager - COMPLETE VERSION
-- Queue system (không block WebSocket)
-- PnL Tracking integration
-- Detailed reporting với full params
+StrategyManager - PERFORMANCE OPTIMIZED VERSION
+- Symbol-indexed lookup để check exits nhanh O(m) thay vì O(n)
+- KHÔNG có Telegram notifications (chỉ BotManager mới notify)
+- Memory management: limit trade_history, cleanup empty indexes
 """
 
 import json
 import traceback
-import asyncio
 from collections import defaultdict
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 import itertools
+
 import numpy as np
 
 from x1.bot.ai.trading_strategy import TradingStrategy
@@ -21,7 +22,12 @@ from x1.bot.utils.LoggerWrapper import LoggerWrapper
 
 
 class StrategyManager:
-    """Manager để tạo và test nhiều strategies"""
+    """
+    Manager để tạo và test nhiều strategies - OPTIMIZED VERSION
+
+    Performance: Symbol-indexed lookup O(m) thay vì O(n)
+    Memory: Cleanup empty indexes, limit history
+    """
 
     def __init__(self, log: LoggerWrapper, tele_message: TelegramMessageQueue, chat_id):
         self.tag = "StrategyManager"
@@ -32,14 +38,16 @@ class StrategyManager:
         self.strategies: List[TradingStrategy] = []
         self.candle_buffer = defaultdict(lambda: defaultdict(list))
 
-        # Optimization indices
-        self.active_strategies_by_symbol = defaultdict(set)
-        self.strategies_with_positions = set()
+        # Memory config
+        self.max_candle_history = 50  # Giảm từ 100 xuống 50
+        self.max_trade_history_per_strategy = 100  # Limit trade history
 
-        # Queue system
-        self.candle_queue = asyncio.Queue(maxsize=10000)
-        self.signal_queue = asyncio.Queue(maxsize=1000)
-        self.batch_size = 1000
+        # ===== PERFORMANCE: Symbol-indexed lookup =====
+        # {symbol: set(strategy_ids có position)} - O(1) lookup
+        self.symbol_to_strategies: Dict[str, Set[int]] = defaultdict(set)
+
+        # Strategy ID -> Strategy object - O(1) lookup
+        self.strategy_map: Dict[int, TradingStrategy] = {}
 
         # Top strategies
         self.top_strategies = []
@@ -47,17 +55,13 @@ class StrategyManager:
         self.best_long = None
         self.best_short = None
 
-        # Performance
-        self.last_candle_process_time = 0
-        self.total_candles_processed = 0
-        self.queue_processing_started = False
-
-        # Enhanced manager (will be set by mexc_pump_bot)
-        self.enhanced_manager = None
+        # Stats for monitoring
+        self._candle_count = 0
+        self._cleanup_interval = 1000  # Cleanup mỗi 1000 candles
 
     def generate_strategies(self, max_strategies: int = 100):
-        """Tạo strategies"""
-        self.log.i(self.tag, f"🔧 Generating {max_strategies} strategies...")
+        """Tạo strategies - 50% LONG, 50% SHORT"""
+        self.log.i(self.tag, f"🔧 Generating {max_strategies} strategies (50% LONG, 50% SHORT)...")
 
         param_grid = {
             'take_profit': [2, 3, 5, 7, 10, 15, 20],
@@ -78,7 +82,6 @@ class StrategyManager:
         combinations = list(itertools.product(*values))
 
         target_per_direction = max_strategies // 2
-
         if len(combinations) > target_per_direction:
             import random
             combinations = random.sample(combinations, target_per_direction)
@@ -92,6 +95,7 @@ class StrategyManager:
             config['direction'] = 'LONG'
             strategy = TradingStrategy(strategy_id, config)
             self.strategies.append(strategy)
+            self.strategy_map[strategy_id] = strategy
             strategy_id += 1
 
         # SHORT strategies
@@ -101,18 +105,19 @@ class StrategyManager:
             config['direction'] = 'SHORT'
             strategy = TradingStrategy(strategy_id, config)
             self.strategies.append(strategy)
+            self.strategy_map[strategy_id] = strategy
             strategy_id += 1
 
-        self.log.i(self.tag, f"✅ Generated {len(self.strategies)} strategies")
+        long_count = sum(1 for s in self.strategies if s.config['direction'] == 'LONG')
+        short_count = sum(1 for s in self.strategies if s.config['direction'] == 'SHORT')
 
-        # Start background processing
-        if not self.queue_processing_started:
-            asyncio.create_task(self._process_candle_queue())
-            asyncio.create_task(self._process_signal_queue())
-            self.queue_processing_started = True
+        self.log.i(self.tag, f"✅ Generated {len(self.strategies)} strategies")
+        self.log.i(self.tag, f"   📈 {long_count} LONG | 📉 {short_count} SHORT")
 
     async def on_candle_update(self, symbol: str, interval: str, candle_data: dict):
-        """Put candle vào queue"""
+        """
+        Nhận candle update - OPTIMIZED với memory management
+        """
         try:
             timestamp = candle_data.get('t', 0)
             candle = {
@@ -124,319 +129,250 @@ class StrategyManager:
                 'volume': float(candle_data.get('a', 0)),
             }
 
+            # Update buffer với limit
             history = self.candle_buffer[symbol][interval]
 
             if len(history) == 0 or timestamp > history[-1]['timestamp']:
                 history.append(candle)
-                if len(history) > 100:
+                # Giảm history size
+                while len(history) > self.max_candle_history:
                     history.pop(0)
-                is_new = True
+                await self.check_all_exits(symbol, interval, candle)
+
             elif timestamp == history[-1]['timestamp']:
                 history[-1] = candle
-                is_new = False
-            else:
-                return
+                await self.check_all_exits(symbol, interval, candle)
 
-            try:
-                self.candle_queue.put_nowait({
-                    'symbol': symbol,
-                    'interval': interval,
-                    'candle': candle,
-                    'is_new': is_new
-                })
-            except asyncio.QueueFull:
-                self.log.w(self.tag, "⚠️ Candle queue full")
+            # Periodic cleanup
+            self._candle_count += 1
+            if self._candle_count >= self._cleanup_interval:
+                self._cleanup_memory()
+                self._candle_count = 0
 
         except Exception as e:
-            self.log.e(self.tag, f"Error queueing candle: {e}")
+            self.log.e(self.tag, f"Error processing candle: {e}\n{traceback.format_exc()}")
 
-    async def _process_candle_queue(self):
-        """Background task xử lý candles"""
-        while True:
-            try:
-                candle_item = await self.candle_queue.get()
-                start_time = datetime.now()
-
-                await self._check_exits_optimized(
-                    candle_item['symbol'],
-                    candle_item['interval'],
-                    candle_item['candle']
-                )
-
-                process_time = (datetime.now() - start_time).total_seconds()
-                self.last_candle_process_time = process_time
-                self.total_candles_processed += 1
-
-                if process_time > 5:
-                    self.log.w(self.tag, f"⚠️ Slow: {process_time:.2f}s")
-
-                self.candle_queue.task_done()
-                await asyncio.sleep(0.001)
-
-            except Exception as e:
-                self.log.e(self.tag, f"Error processing candle queue: {e}")
-                await asyncio.sleep(0.1)
-
-    async def _check_exits_optimized(self, symbol: str, interval: str, candle: dict):
-        """Chỉ check strategies có positions"""
+    def _cleanup_memory(self):
+        """Cleanup empty indexes và old data để tránh memory leak"""
         try:
-            if symbol not in self.active_strategies_by_symbol:
-                return
+            # Cleanup empty symbol_to_strategies entries
+            empty_symbols = [s for s, ids in self.symbol_to_strategies.items() if len(ids) == 0]
+            for symbol in empty_symbols:
+                del self.symbol_to_strategies[symbol]
 
-            strategy_ids = list(self.active_strategies_by_symbol[symbol])
-            if not strategy_ids:
-                return
+            # Limit trade_history trong mỗi strategy
+            for strategy in self.strategies:
+                if len(strategy.trade_history) > self.max_trade_history_per_strategy:
+                    # Giữ lại trades gần nhất
+                    strategy.trade_history = strategy.trade_history[-self.max_trade_history_per_strategy:]
 
-            tasks = []
-            for strategy_id in strategy_ids:
-                strategy = self.strategies[strategy_id - 1]
+            # Cleanup candle_buffer cho symbols không còn track
+            active_symbols = set(self.symbol_to_strategies.keys())
+            # Giữ buffer cho symbols đang có positions
 
-                if symbol in strategy.active_positions:
-                    task = self._check_strategy_exit_async(strategy, symbol, candle)
-                    tasks.append(task)
-
-                    if len(tasks) >= self.batch_size:
-                        await asyncio.gather(*tasks, return_exceptions=True)
-                        tasks = []
-                        await asyncio.sleep(0)
-
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+            if len(empty_symbols) > 0:
+                self.log.d(self.tag, f"🧹 Cleaned up {len(empty_symbols)} empty symbol indexes")
 
         except Exception as e:
-            self.log.e(self.tag, f"Error checking exits: {e}")
-
-    async def _check_strategy_exit_async(self, strategy: TradingStrategy, symbol: str, candle: dict):
-        """Check exit - không gửi telegram"""
-        try:
-            exit_info = strategy.check_exit(symbol, candle)
-
-            if exit_info:
-                strategy.close_position(
-                    symbol,
-                    exit_info['exit_price'],
-                    exit_info['reason']
-                )
-
-                if not strategy.active_positions:
-                    self.strategies_with_positions.discard(strategy.strategy_id)
-
-                self.active_strategies_by_symbol[symbol].discard(strategy.strategy_id)
-
-                # Chỉ log
-                if strategy.trade_history:
-                    pnl = strategy.trade_history[-1]['pnl_usdt']
-                    emoji = "✅" if pnl > 0 else "❌"
-                    if constants.DEBUG_LOG:
-                        self.log.d(self.tag,
-                              f"{emoji} Strategy {strategy.strategy_id} closed {symbol} - "
-                              f"{exit_info['reason']} - PnL: ${pnl:.2f}")
-
-        except Exception as e:
-            self.log.e(self.tag, f"Error in strategy {strategy.strategy_id}: {e}")
+            self.log.e(self.tag, f"Error in cleanup: {e}")
 
     async def on_pump_signal(self, signal: Dict):
-        """Put signal vào queue"""
-        try:
-            try:
-                self.signal_queue.put_nowait(signal.copy())
-            except asyncio.QueueFull:
-                self.log.w(self.tag, "⚠️ Signal queue full")
-        except Exception as e:
-            self.log.e(self.tag, f"Error queueing signal: {e}")
-
-    async def _process_signal_queue(self):
-        """Background task xử lý signals"""
-        while True:
-            try:
-                signal = await self.signal_queue.get()
-                await self._process_pump_signal(signal)
-                self.signal_queue.task_done()
-                await asyncio.sleep(0.001)
-            except Exception as e:
-                self.log.e(self.tag, f"Error processing signal queue: {e}")
-                await asyncio.sleep(0.1)
-
-    async def _process_pump_signal(self, signal: Dict):
-        """Xử lý pump signal"""
+        """Nhận pump signal và test strategies"""
         try:
             symbol = signal['symbol']
             price = signal['price']
+            timeframe = signal.get('timeframe', '1m')
 
             entered_count = 0
-            tasks = []
+            matched_strategies = []
 
             for strategy in self.strategies:
-                task = self._check_strategy_entry_async(strategy, signal, symbol, price)
-                tasks.append(task)
+                if strategy.should_enter(signal):
+                    if symbol not in strategy.active_positions:
+                        strategy.enter_position(symbol, price, signal)
+                        entered_count += 1
+                        matched_strategies.append(strategy.strategy_id)
 
-                if len(tasks) >= self.batch_size:
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    entered_count += sum(1 for r in results if r is True)
-                    tasks = []
-                    await asyncio.sleep(0)
-
-            if tasks:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                entered_count += sum(1 for r in results if r is True)
+                        # Add to symbol index for O(1) lookup later
+                        self.symbol_to_strategies[symbol].add(strategy.strategy_id)
 
             if entered_count > 0:
-                self.log.i(self.tag, f"✅ {entered_count} strategies entered {symbol}")
+                self.log.i(self.tag, f"✅ {entered_count}/{len(self.strategies)} strategies entered {symbol}")
+            else:
+                self.log.d(self.tag, f"⚠️ NO strategies matched for {symbol}")
 
         except Exception as e:
-            self.log.e(self.tag, f"Error processing signal: {e}")
+            self.log.e(self.tag, f"Error handling signal: {e}\n{traceback.format_exc()}")
 
-    async def _check_strategy_entry_async(self, strategy: TradingStrategy,
-                                          signal: Dict, symbol: str, price: float) -> bool:
-        """Check entry"""
+    async def check_all_exits(self, symbol: str, interval: str, candle: Dict):
+        """
+        OPTIMIZED: Chỉ check strategies có position với symbol này
+        O(m) thay vì O(n) - m << n
+        """
         try:
-            if symbol in strategy.active_positions:
-                return False
+            # Lấy strategy_ids có position với symbol này
+            strategy_ids = self.symbol_to_strategies.get(symbol)
 
-            if strategy.should_enter(signal):
-                strategy.enter_position(symbol, price, signal)
-                self.strategies_with_positions.add(strategy.strategy_id)
-                self.active_strategies_by_symbol[symbol].add(strategy.strategy_id)
-                return True
-            return False
+            if not strategy_ids:
+                return  # Không có strategy nào - SKIP
+
+            # Chỉ check strategies có position
+            for strategy_id in list(strategy_ids):
+                strategy = self.strategy_map.get(strategy_id)
+                if not strategy:
+                    continue
+
+                if symbol in strategy.active_positions:
+                    exit_info = strategy.check_exit(symbol, candle)
+
+                    if exit_info:
+                        strategy.close_position(
+                            symbol,
+                            exit_info['exit_price'],
+                            exit_info['reason']
+                        )
+
+                        # Remove từ index
+                        self.symbol_to_strategies[symbol].discard(strategy_id)
+
+                        # Log only
+                        pnl = strategy.trade_history[-1]['pnl_usdt']
+                        emoji = "✅" if pnl > 0 else "❌"
+                        if constants.DEBUG_LOG:
+                            self.log.d(self.tag,
+                                   f"{emoji} S#{strategy.strategy_id} closed {symbol} - "
+                                   f"{exit_info['reason']} - PnL: ${pnl:.2f}"
+                                   )
+
         except Exception as e:
-            return False
+            self.log.e(self.tag, f"Error checking exits: {e}\n{traceback.format_exc()}")
 
     def calculate_rankings(self):
-        """Calculate rankings"""
-        try:
-            self.log.i(self.tag, "📊 Calculating rankings...")
+        """Tính rankings"""
+        self.log.i(self.tag, "📊 Calculating strategy rankings...")
 
-            strategies_with_trades = []
-            for strategy in self.strategies:
-                if strategy.stats['total_trades'] > 0:
-                    strategy.calculate_final_stats()
-                    strategies_with_trades.append(strategy)
+        for strategy in self.strategies:
+            strategy.calculate_final_stats()
 
-            if not strategies_with_trades:
-                return
+        strategies_with_trades = [s for s in self.strategies if s.stats['total_trades'] > 0]
 
-            long_strategies = [s for s in strategies_with_trades if s.config['direction'] == 'LONG']
-            short_strategies = [s for s in strategies_with_trades if s.config['direction'] == 'SHORT']
+        if not strategies_with_trades:
+            self.log.w(self.tag, "⚠️ No strategies have any trades yet")
+            return
 
-            sorted_long = sorted(long_strategies, key=lambda s: s.stats.get('total_pnl', 0), reverse=True)
-            sorted_short = sorted(short_strategies, key=lambda s: s.stats.get('total_pnl', 0), reverse=True)
+        long_strategies = [s for s in strategies_with_trades if s.config['direction'] == 'LONG']
+        short_strategies = [s for s in strategies_with_trades if s.config['direction'] == 'SHORT']
 
-            all_sorted = sorted(strategies_with_trades, key=lambda s: s.stats.get('total_pnl', 0), reverse=True)
-            self.top_strategies = all_sorted[:10]
-            self.best_strategy = all_sorted[0] if all_sorted else None
-            self.best_long = sorted_long[0] if sorted_long else None
-            self.best_short = sorted_short[0] if sorted_short else None
+        sorted_long = sorted(long_strategies, key=lambda s: s.stats.get('total_pnl', 0), reverse=True)
+        sorted_short = sorted(short_strategies, key=lambda s: s.stats.get('total_pnl', 0), reverse=True)
 
-        except Exception as e:
-            self.log.e(self.tag, f"Error calculating rankings: {e}")
+        all_sorted = sorted(strategies_with_trades, key=lambda s: s.stats.get('total_pnl', 0), reverse=True)
+        self.top_strategies = all_sorted[:10]
+        self.best_strategy = all_sorted[0] if all_sorted else None
+        self.best_long = sorted_long[0] if sorted_long else None
+        self.best_short = sorted_short[0] if sorted_short else None
+
+        self.log.i(self.tag, f"✅ {len(long_strategies)} LONG + {len(short_strategies)} SHORT have trades")
 
     async def report_results(self):
-        """REPORT với PnL tracking nếu có"""
+        """Report kết quả với chi tiết config"""
         try:
-            # ✨ Nếu có enhanced manager, dùng nó
-            if hasattr(self, 'enhanced_manager') and self.enhanced_manager:
-                self.enhanced_manager.calculate_rankings_with_unrealized()
-                message = self.enhanced_manager.build_detailed_report_with_unrealized()
-            else:
-                # Fallback to normal
-                self.calculate_rankings()
-                message = self._build_normal_report()
+            self.calculate_rankings()
 
-            await self.tele_message.send_message(message, self.chat_id)
+            if not self.best_strategy:
+                strategies_with_positions = sum(1 for s in self.strategies if len(s.active_positions) > 0)
+                total_positions = sum(len(s.active_positions) for s in self.strategies)
+                tracked = sum(len(s) for s in self.symbol_to_strategies.values())
 
-        except Exception as e:
-            self.log.e(self.tag, f"Error reporting: {e}")
+                message = (
+                    f"📊 <b>BACKTEST STATUS</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"⏳ Waiting for trades...\n\n"
+                    f"📈 Strategies with positions: {strategies_with_positions}\n"
+                    f"💼 Total positions: {total_positions}\n"
+                    f"🔍 Tracked (optimized): {tracked}"
+                )
+                await self.tele_message.send_message(message, self.chat_id)
+                return
 
-    def _build_normal_report(self) -> str:
-        """Build report bình thường (không có unrealized PnL)"""
-        if not self.best_strategy:
-            message = (
-                f"📊 BACKTEST STATUS\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"⏳ Waiting for trades...\n\n"
-                f"📈 Strategies with positions: {len(self.strategies_with_positions)}/{len(self.strategies)}\n"
-                f"⚡ Avg candle time: {self.last_candle_process_time:.3f}s\n"
-                f"📦 Queue: C={self.candle_queue.qsize()} S={self.signal_queue.qsize()}"
-            )
-            return message
+            message = "📊 <b>BACKTEST REPORT</b>\n"
+            message += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        # Build detailed report
-        message = "📊 BACKTEST RESULTS - TOP 10\n"
-        message += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            # Top 5 với config chi tiết
+            message += "🏆 <b>TOP 5:</b>\n"
+            for i, strategy in enumerate(self.top_strategies[:5], 1):
+                config = strategy.config
+                stats = strategy.stats
+                direction = config.get('direction', 'LONG')
+                emoji = "📈" if direction == 'LONG' else "📉"
 
-        # Best overall
-        s = self.best_strategy
-        stats = s.stats
-        config = s.config
+                message += (
+                    f"\n{i}. {emoji} <b>#{strategy.strategy_id}</b>\n"
+                    f"   💰 ${stats['total_pnl']:.2f} | {stats['total_trades']}T | "
+                    f"WR:{stats['win_rate']:.0f}%\n"
+                    f"   ⚙️ {direction} TP{config['take_profit']}% SL{config['stop_loss']}% "
+                    f"Vol{config['volume_multiplier']}x Conf{config['min_confidence']}%\n"
+                )
 
-        message += f"🏆 BEST OVERALL - Strategy #{s.strategy_id} ({config['direction']})\n"
-        message += f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        message += f"📊 Performance:\n"
-        message += f"  • Trades: {stats['total_trades']} ({stats['winning_trades']}W/{stats['losing_trades']}L)\n"
-        message += f"  • Win Rate: {stats['win_rate']:.1f}%\n"
-        message += f"  • Total PnL: ${stats['total_pnl']:.2f}\n"
-        message += f"  • Profit Factor: {stats.get('profit_factor', 0):.2f}\n"
-        message += f"\n⚙️ Config:\n"
-        message += f"  • TP: {config['take_profit']}% | SL: {config['stop_loss']}%\n"
-        message += f"  • Vol: >{config['volume_multiplier']}x | RSI: >{config['rsi_threshold']}\n"
-        message += f"  • Confidence: >{config['min_confidence']}%\n\n"
+            # Best LONG/SHORT
+            if self.best_long:
+                c = self.best_long.config
+                s = self.best_long.stats
+                message += (
+                    f"\n📈 <b>BEST LONG #{self.best_long.strategy_id}:</b>\n"
+                    f"   ${s['total_pnl']:.2f} | {s['total_trades']}T | WR:{s['win_rate']:.0f}%\n"
+                    f"   TP{c['take_profit']}% SL{c['stop_loss']}% Vol{c['volume_multiplier']}x "
+                    f"Conf{c['min_confidence']}% RSI{c['rsi_threshold']}\n"
+                )
 
-        # Top 10
-        message += f"📊 TOP 10 STRATEGIES:\n"
-        message += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            if self.best_short:
+                c = self.best_short.config
+                s = self.best_short.stats
+                message += (
+                    f"\n📉 <b>BEST SHORT #{self.best_short.strategy_id}:</b>\n"
+                    f"   ${s['total_pnl']:.2f} | {s['total_trades']}T | WR:{s['win_rate']:.0f}%\n"
+                    f"   TP{c['take_profit']}% SL{c['stop_loss']}% Vol{c['volume_multiplier']}x "
+                    f"Conf{c['min_confidence']}% RSI{c['rsi_threshold']}\n"
+                )
 
-        for rank, strategy in enumerate(self.top_strategies, 1):
-            stats = strategy.stats
-            config = strategy.config
+            # Overall
+            strategies_with_trades = [s for s in self.strategies if s.stats['total_trades'] > 0]
+            total_trades = sum(s.stats['total_trades'] for s in strategies_with_trades)
+            avg_wr = np.mean([s.stats['win_rate'] for s in strategies_with_trades]) if strategies_with_trades else 0
 
             message += (
-                f"#{rank}. S{strategy.strategy_id} {config['direction']}: "
-                f"WR={stats['win_rate']:.0f}% PnL=${stats['total_pnl']:.0f} "
-                f"PF={stats.get('profit_factor', 0):.1f} "
-                f"[TP{config['take_profit']}% SL{config['stop_loss']}%]\n"
+                f"\n📊 <b>OVERALL:</b>\n"
+                f"Strategies: {len(self.strategies)} | Active: {len(strategies_with_trades)}\n"
+                f"Total trades: {total_trades} | Avg WR: {avg_wr:.1f}%"
             )
 
-        # Performance
-        message += f"\n⚡ PERFORMANCE:\n"
-        message += f"  Candle time: {self.last_candle_process_time:.3f}s\n"
-        message += f"  Active positions: {len(self.strategies_with_positions)}\n"
+            self.log.i(self.tag, message)
+            await self.tele_message.send_message(message, self.chat_id)
+            self.save_results_to_file()
 
-        return message
+        except Exception as e:
+            self.log.e(self.tag, f"Error reporting: {e}\n{traceback.format_exc()}")
 
     def save_results_to_file(self):
-        """Lưu kết quả"""
+        """Lưu kết quả vào file"""
         try:
             results = []
             for strategy in self.strategies:
-                if strategy.stats['total_trades'] > 0:
-                    summary = strategy.get_summary()
-                    summary['trade_history'] = strategy.trade_history
-                    results.append(summary)
+                summary = strategy.get_summary()
+                summary['config_details'] = strategy.config
+                summary['trade_history'] = strategy.trade_history
+                results.append(summary)
 
             filename = f"strategy_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
             with open(filename, 'w') as f:
                 json.dump(results, f, indent=2, default=str)
 
-            self.log.i(self.tag, f"💾 Results saved to {filename}")
+            self.log.i(self.tag, f"💾 Saved to {filename}")
 
         except Exception as e:
-            self.log.e(self.tag, f"Error saving results: {e}")
+            self.log.e(self.tag, f"Error saving: {e}")
 
     def get_best_strategy_config(self) -> Optional[Dict]:
-        """Lấy config tốt nhất"""
         if self.best_strategy:
             return self.best_strategy.config
         return None
-
-    def get_performance_stats(self) -> Dict:
-        """Get stats"""
-        return {
-            'total_strategies': len(self.strategies),
-            'strategies_with_trades': sum(1 for s in self.strategies if s.stats['total_trades'] > 0),
-            'strategies_with_positions': len(self.strategies_with_positions),
-            'avg_candle_process_time': self.last_candle_process_time,
-            'total_candles_processed': self.total_candles_processed,
-            'candle_queue_size': self.candle_queue.qsize(),
-            'signal_queue_size': self.signal_queue.qsize(),
-        }
