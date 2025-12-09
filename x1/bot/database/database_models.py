@@ -1,9 +1,10 @@
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Database models cho MEXC Trading Bot System
+Database models cho Trading Bot System
 Using SQLAlchemy ORM
 
-UPDATED: Thêm field 'reduce' cho Reduce TP strategy
+UPDATED: Thêm field 'reduce' thay thế 'trailing_stop'
 """
 
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, Text, ForeignKey, Enum
@@ -59,16 +60,12 @@ class BotConfig(Base):
     min_confidence = Column(Float, nullable=False)
 
     # Advanced settings
-    trailing_stop = Column(Boolean, default=False)
+    trailing_stop = Column(Boolean, default=False)  # Kept for backwards compatibility
+    reduce = Column(Float, default=0.0)  # ✨ NEW: Reduce TP % per minute (0 = disabled)
     min_trend_strength = Column(Float, default=0.0)
     require_breakout = Column(Boolean, default=False)
     min_volume_consistency = Column(Float, default=0.0)
     timeframe = Column(String(10), default='1m')
-
-    # ===== REDUCE TP STRATEGY =====
-    # reduce = % TP giảm mỗi phút (0 = disabled, dùng trailing_stop thay thế)
-    # Ví dụ: reduce=5 với TP=40% → mỗi phút TP giảm 5% của tổng khoảng cách
-    reduce = Column(Float, default=0.0)
 
     # Mode
     trade_mode = Column(Enum(TradeModeEnum), nullable=False, default=TradeModeEnum.SIMULATED)
@@ -98,13 +95,13 @@ class BotConfig(Base):
             'direction': self.direction.value,
             'take_profit': self.take_profit,
             'stop_loss': self.stop_loss,
-            'reduce': self.reduce,  # NEW
             'position_size_usdt': self.position_size_usdt,
             'price_increase_threshold': self.price_increase_threshold,
             'volume_multiplier': self.volume_multiplier,
             'rsi_threshold': self.rsi_threshold,
             'min_confidence': self.min_confidence,
             'trailing_stop': self.trailing_stop,
+            'reduce': self.reduce,  # ✨ NEW
             'trade_mode': self.trade_mode.value,
             'is_active': self.is_active,
             'total_trades': self.total_trades,
@@ -141,9 +138,7 @@ class Trade(Base):
     # Targets
     take_profit = Column(Float, nullable=False)
     stop_loss = Column(Float, nullable=False)
-
-    # ===== REDUCE TP TRACKING =====
-    initial_take_profit = Column(Float, nullable=True)  # TP ban đầu trước khi reduce
+    reduce = Column(Float, default=0.0)  # ✨ NEW: Reduce rate at entry
 
     # Tracking
     highest_price = Column(Float, nullable=True)
@@ -152,7 +147,7 @@ class Trade(Base):
     # Result
     pnl_usdt = Column(Float, nullable=True)
     pnl_percent = Column(Float, nullable=True)
-    exit_reason = Column(String(50), nullable=True)  # TP, SL, TP_REDUCED, MANUAL, CANCELLED
+    exit_reason = Column(String(50), nullable=True)
 
     # Status
     status = Column(Enum(TradeStatusEnum), nullable=False, default=TradeStatusEnum.OPEN)
@@ -180,8 +175,8 @@ class Trade(Base):
             'exit_time': self.exit_time.isoformat() if self.exit_time else None,
             'quantity': self.quantity,
             'take_profit': self.take_profit,
-            'initial_take_profit': self.initial_take_profit,
             'stop_loss': self.stop_loss,
+            'reduce': self.reduce,  # ✨ NEW
             'pnl_usdt': self.pnl_usdt,
             'pnl_percent': self.pnl_percent,
             'exit_reason': self.exit_reason,
@@ -202,8 +197,8 @@ class Order(Base):
     # Order info
     exchange_order_id = Column(String(100), nullable=True)
     symbol = Column(String(50), nullable=False)
-    side = Column(String(10), nullable=False)  # BUY, SELL
-    order_type = Column(String(20), nullable=False)  # MARKET, LIMIT
+    side = Column(String(10), nullable=False)
+    order_type = Column(String(20), nullable=False)
 
     # Price & Quantity
     price = Column(Float, nullable=True)
@@ -249,7 +244,7 @@ class BacktestResult(Base):
     strategy_id = Column(Integer, nullable=False)
     strategy_name = Column(String(200), nullable=False)
 
-    # Config (JSON)
+    # Config (JSON) - chứa tất cả config bao gồm reduce
     config_json = Column(Text, nullable=False)
 
     # Results
@@ -293,7 +288,7 @@ class BacktestResult(Base):
 class DatabaseManager:
     """Quản lý database connection và operations"""
 
-    def __init__(self, db_url='sqlite:///mexc_trading_bot.db'):
+    def __init__(self, db_url='sqlite:///trading_bot.db'):
         self.engine = create_engine(db_url, echo=False)
         Base.metadata.create_all(self.engine)
         self.Session = sessionmaker(bind=self.engine)
@@ -309,23 +304,34 @@ class DatabaseManager:
         """Xóa tất cả tables (cẩn thận!)"""
         Base.metadata.drop_all(self.engine)
 
-    def add_reduce_column_if_not_exists(self):
-        """Migration: Thêm column 'reduce' nếu chưa có"""
-        from sqlalchemy import inspect, text
+    def migrate_add_reduce_column(self):
+        """
+        Migration: Thêm column 'reduce' vào existing database
+        Chạy 1 lần nếu database đã tồn tại
+        """
+        from sqlalchemy import text
 
-        inspector = inspect(self.engine)
-        columns = [col['name'] for col in inspector.get_columns('bot_configs')]
-
-        if 'reduce' not in columns:
+        try:
             with self.engine.connect() as conn:
-                conn.execute(text('ALTER TABLE bot_configs ADD COLUMN reduce FLOAT DEFAULT 0.0'))
+                # Add reduce to bot_configs
+                conn.execute(text("ALTER TABLE bot_configs ADD COLUMN reduce FLOAT DEFAULT 0.0"))
+                # Add reduce to trades
+                conn.execute(text("ALTER TABLE trades ADD COLUMN reduce FLOAT DEFAULT 0.0"))
                 conn.commit()
-            print("✅ Added 'reduce' column to bot_configs table")
+                print("✅ Migration successful: Added 'reduce' column")
+        except Exception as e:
+            if "duplicate column" in str(e).lower() or "already exists" in str(e).lower():
+                print("ℹ️ Column 'reduce' already exists")
+            else:
+                print(f"⚠️ Migration error: {e}")
 
-        # Thêm initial_take_profit vào trades
-        columns = [col['name'] for col in inspector.get_columns('trades')]
-        if 'initial_take_profit' not in columns:
-            with self.engine.connect() as conn:
-                conn.execute(text('ALTER TABLE trades ADD COLUMN initial_take_profit FLOAT'))
-                conn.commit()
-            print("✅ Added 'initial_take_profit' column to trades table")
+
+# Example usage
+if __name__ == "__main__":
+    db = DatabaseManager()
+    db.create_tables()
+
+    # Run migration nếu cần
+    db.migrate_add_reduce_column()
+
+    print("✅ Database ready with 'reduce' field")

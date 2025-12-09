@@ -72,7 +72,7 @@ class StrategyManager:
             'min_confidence': [30, 40, 50, 60],
             'timeframe': ['1m'],
             # ===== REDUCE TP (thay thế trailing_stop) =====
-            'reduce': [0, 5, 10],  # 0 = disabled, 2-10% per minute
+            'reduce': [2, 5, 8, 10],  # 0 = disabled, 2-10% per minute
             'min_trend_strength': [0.0],
             'require_breakout': [False],
             'min_volume_consistency': [0.0],

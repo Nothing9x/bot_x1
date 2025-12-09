@@ -33,6 +33,14 @@ try:
 except ImportError:
     PNL_TRACKING_AVAILABLE = False
 
+# ✨ THÊM IMPORT - Bot Config Auto Updater
+try:
+    from x1.bot.trading.bot_config_updater import BotConfigUpdater
+
+    CONFIG_UPDATER_AVAILABLE = True
+except ImportError:
+    CONFIG_UPDATER_AVAILABLE = False
+
 
 class MexcPumpBot:
     """
@@ -47,6 +55,8 @@ class MexcPumpBot:
         # ✨ THÊM ATTRIBUTES - PnL Tracking
         self.enhanced_bot_mgr = None
         self.enhanced_strat_mgr = None
+        # ✨ THÊM ATTRIBUTE - Config Auto Updater
+        self.config_updater = None
 
         bot_token = BotConfig.TELEGRAM_BOT_TOKEN
         self.admin_proxy = proxy or BotConfig.PROXY
@@ -153,6 +163,24 @@ class MexcPumpBot:
                         self.log.w(self.tag, f"⚠️ PnL tracking init failed: {e}")
                 else:
                     self.log.w(self.tag, "⚠️ PnL tracking not available")
+
+                # ✨ THÊM - INTEGRATE CONFIG AUTO UPDATER
+                if CONFIG_UPDATER_AVAILABLE:
+                    try:
+                        self.config_updater = BotConfigUpdater(
+                            db_manager=self.db_manager,
+                            strategy_manager=self.strategy_manager,
+                            log=self.log,
+                            tele_message=self.tele_message,
+                            chat_id=self.chat_id
+                        )
+                        # Config: update mỗi 1 giờ
+                        self.config_updater.set_update_interval_hours(1)
+                        self.log.i(self.tag, "✅ Bot Config Auto Updater initialized (interval: 1h)")
+                    except Exception as e:
+                        self.log.w(self.tag, f"⚠️ Config updater init failed: {e}")
+                else:
+                    self.log.w(self.tag, "⚠️ Config updater not available")
 
                 bot_stats = self.bot_manager.get_stats()
 
@@ -288,6 +316,11 @@ class MexcPumpBot:
             # Start monitoring tasks
             asyncio.create_task(self.periodic_report())
             asyncio.create_task(self.status_monitor())
+
+            # ✨ THÊM - Start Config Auto Updater
+            if self.config_updater:
+                asyncio.create_task(self.config_updater.start())
+                self.log.i(self.tag, "✅ Config Auto Updater started")
 
             exchange_name = BotConfig.get_exchange_name()
             self.log.i(self.tag, f"✅ Bot is running with {exchange_name}!")
@@ -471,6 +504,49 @@ class MexcPumpBot:
 
         except Exception as e:
             self.log.e(self.tag, f"Error creating production bots: {e}\n{traceback.format_exc()}")
+
+    # ✨ THÊM - CONFIG UPDATER CONTROL METHODS
+
+    async def force_update_bot_configs(self):
+        """
+        Force update bot configs ngay lập tức
+        Gọi từ command hoặc API
+        """
+        if not self.config_updater:
+            self.log.e(self.tag, "❌ Config updater not available")
+            return None
+
+        self.log.i(self.tag, "⚡ Force updating bot configs...")
+        result = await self.config_updater.force_update()
+
+        await self.tele_message.send_message(
+            f"⚡ Force update completed!\n"
+            f"Updated: {result['updated_count']}, Created: {result['created_count']}",
+            self.chat_id
+        )
+
+        return result
+
+    def set_config_update_interval(self, hours: float):
+        """
+        Set interval cho auto update (in hours)
+
+        Args:
+            hours: Số giờ giữa mỗi lần update (ví dụ: 1, 2, 0.5 cho 30 phút)
+        """
+        if not self.config_updater:
+            self.log.e(self.tag, "❌ Config updater not available")
+            return
+
+        self.config_updater.set_update_interval_hours(hours)
+        self.log.i(self.tag, f"✅ Config update interval set to {hours}h")
+
+    def get_config_updater_stats(self) -> Dict:
+        """Lấy thống kê của config updater"""
+        if not self.config_updater:
+            return {'error': 'Config updater not available'}
+
+        return self.config_updater.get_stats()
 
 
 # ===== ENTRY POINT =====
