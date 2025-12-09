@@ -1,8 +1,18 @@
+# -*- coding: utf-8 -*-
+"""
+TradingStrategy - Strategy với Reduce TP cho backtest
+
+REDUCE TP STRATEGY:
+- Thay thế trailing_stop
+- Mỗi phút, TP giảm reduce% của tổng khoảng cách (TP → Entry → SL)
+- Khi TP = SL → force close
+"""
+
 import asyncio
 import json
 import traceback
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import itertools
 import copy
@@ -11,7 +21,7 @@ import copy
 class TradingStrategy:
     """
     Một strategy cụ thể với các config riêng
-    Hỗ trợ cả LONG và SHORT
+    Hỗ trợ cả LONG và SHORT với Reduce TP
     """
 
     def __init__(self, strategy_id: int, config: Dict):
@@ -39,28 +49,24 @@ class TradingStrategy:
 
         # PnL tracking
         self.pnl_history = []
-        self.peak_balance = 1000  # Initial balance
+        self.peak_balance = 1000
         self.current_balance = 1000
 
     def get_name(self):
-        """Tên strategy - Thêm direction"""
+        """Tên strategy - Thêm direction và reduce"""
         direction = self.config.get('direction', 'LONG')
-        breakout_str = "BRK" if self.config.get('require_breakout', False) else ""
+        reduce = self.config.get('reduce', 0)
+        reduce_str = f"_R{reduce}" if reduce > 0 else ""
+
         return (f"S{self.strategy_id:03d}_{direction}_"
                 f"TP{self.config['take_profit']}%_"
-                f"SL{self.config['stop_loss']}%_"
+                f"SL{self.config['stop_loss']}%{reduce_str}_"
                 f"RSI{self.config['rsi_threshold']}_"
                 f"Vol{self.config['volume_multiplier']}x_"
-                f"Trend{self.config.get('min_trend_strength', 0.5)}_"
-                f"{breakout_str}_"
                 f"{self.config['timeframe']}")
 
     def should_enter(self, signal: Dict) -> bool:
-        """
-        Kiểm tra xem có nên vào lệnh không - DỄ DÀNG HƠN
-        Để strategies tự test, không filter quá nhiều
-        """
-
+        """Kiểm tra xem có nên vào lệnh không"""
         # Kiểm tra timeframe
         signal_timeframe = signal.get('timeframe', '1m')
         if signal_timeframe != self.config['timeframe']:
@@ -79,32 +85,29 @@ class TradingStrategy:
         if signal.get('volume_ratio', 0) < self.config['volume_multiplier']:
             return False
 
-        # Kiểm tra RSI - CHO PHÉP BỎ QUA nếu không có RSI
+        # Kiểm tra RSI
         rsi = signal.get('rsi')
         if rsi is not None:
             if rsi < self.config['rsi_threshold']:
                 return False
-            # Bỏ check RSI > 85, cho phép trade khi RSI cao
 
         # Kiểm tra confidence
         if signal.get('confidence', 0) < self.config['min_confidence']:
             return False
 
-        # Các điều kiện dưới đây là OPTIONAL - cho phép bỏ qua
-
-        # Trend strength - cho phép strategy không yêu cầu
+        # Trend strength (optional)
         min_trend = self.config.get('min_trend_strength', 0)
         if min_trend > 0:
             trend_strength = signal.get('trend_strength', 0)
             if trend_strength < min_trend:
                 return False
 
-        # Breakout - chỉ check nếu required
+        # Breakout (optional)
         if self.config.get('require_breakout', False):
             if not signal.get('is_breakout', False):
                 return False
 
-        # Volume consistency - cho phép strategy không yêu cầu
+        # Volume consistency (optional)
         min_vol_cons = self.config.get('min_volume_consistency', 0)
         if min_vol_cons > 0:
             volume_consistency = signal.get('volume_consistency', 0)
@@ -114,18 +117,16 @@ class TradingStrategy:
         return True
 
     def enter_position(self, symbol: str, entry_price: float, signal: Dict):
-        """Vào lệnh - Hỗ trợ cả LONG và SHORT"""
+        """Vào lệnh - Hỗ trợ cả LONG và SHORT với Reduce TP"""
         position_size = self.config['position_size_usdt']
         quantity = position_size / entry_price
 
         direction = self.config.get('direction', 'LONG')
 
         if direction == 'LONG':
-            # LONG: Mua thấp, bán cao
             take_profit_price = entry_price * (1 + self.config['take_profit'] / 100)
             stop_loss_price = entry_price * (1 - self.config['stop_loss'] / 100)
         else:  # SHORT
-            # SHORT: Bán cao, mua thấp
             take_profit_price = entry_price * (1 - self.config['take_profit'] / 100)
             stop_loss_price = entry_price * (1 + self.config['stop_loss'] / 100)
 
@@ -136,17 +137,18 @@ class TradingStrategy:
             'entry_time': datetime.now(),
             'quantity': quantity,
             'take_profit': take_profit_price,
+            'initial_take_profit': take_profit_price,  # Lưu TP ban đầu cho reduce
             'stop_loss': stop_loss_price,
-            'highest_price': entry_price,  # For LONG trailing
-            'lowest_price': entry_price,  # For SHORT trailing
+            'highest_price': entry_price,
+            'lowest_price': entry_price,
             'signal': signal,
+            'last_reduce_minute': 0,  # Track reduce
         }
 
     def check_exit(self, symbol: str, current_candle: Dict) -> Optional[Dict]:
         """
         Kiểm tra xem có nên thoát lệnh không
-        Hỗ trợ cả LONG và SHORT
-        Returns: {'reason': 'TP'/'SL', 'exit_price': float} or None
+        Hỗ trợ cả LONG và SHORT với REDUCE TP (thay thế trailing stop)
         """
         if symbol not in self.active_positions:
             return None
@@ -157,21 +159,23 @@ class TradingStrategy:
         low = current_candle['low']
         close = current_candle['close']
 
+        # ===== REDUCE TP: Update TP theo thời gian =====
+        reduce = self.config.get('reduce', 0)
+        if reduce > 0:
+            new_tp = self._calculate_reduced_tp(position)
+            if new_tp != position['take_profit']:
+                position['take_profit'] = new_tp
+
+        # Update highest/lowest (cho tracking, không dùng trailing stop nữa)
         if direction == 'LONG':
-            # Update highest price for trailing stop
             if high > position['highest_price']:
                 position['highest_price'] = high
 
-                # Update trailing stop if enabled
-                if self.config.get('trailing_stop', False):
-                    new_stop = high * (1 - self.config['stop_loss'] / 100)
-                    if new_stop > position['stop_loss']:
-                        position['stop_loss'] = new_stop
-
             # Check TP (giá tăng lên)
             if high >= position['take_profit']:
+                is_reduced = position['take_profit'] != position['initial_take_profit']
                 return {
-                    'reason': 'TP',
+                    'reason': 'TP_REDUCED' if is_reduced else 'TP',
                     'exit_price': position['take_profit']
                 }
 
@@ -183,20 +187,14 @@ class TradingStrategy:
                 }
 
         else:  # SHORT
-            # Update lowest price for trailing stop
             if low < position['lowest_price']:
                 position['lowest_price'] = low
 
-                # Update trailing stop if enabled
-                if self.config.get('trailing_stop', False):
-                    new_stop = low * (1 + self.config['stop_loss'] / 100)
-                    if new_stop < position['stop_loss']:
-                        position['stop_loss'] = new_stop
-
             # Check TP (giá giảm xuống)
             if low <= position['take_profit']:
+                is_reduced = position['take_profit'] != position['initial_take_profit']
                 return {
-                    'reason': 'TP',
+                    'reason': 'TP_REDUCED' if is_reduced else 'TP',
                     'exit_price': position['take_profit']
                 }
 
@@ -209,8 +207,71 @@ class TradingStrategy:
 
         return None
 
+    def _calculate_reduced_tp(self, position: Dict) -> float:
+        """
+        Tính TP mới sau khi apply reduce
+
+        Logic:
+        - Mỗi phút, TP giảm reduce% của tổng khoảng cách (TP → Entry → SL)
+        - LONG: TP giảm từ trên xuống
+        - SHORT: TP tăng từ dưới lên (về phía SL)
+        """
+        reduce = self.config.get('reduce', 0)
+        if reduce <= 0:
+            return position['take_profit']
+
+        # Tính số phút đã hold
+        entry_time = position.get('entry_time', datetime.now())
+        hold_time = datetime.now() - entry_time
+        minutes_held = int(hold_time.total_seconds() / 60)
+
+        # Chỉ reduce mỗi phút một lần
+        if minutes_held <= position.get('last_reduce_minute', 0):
+            return position['take_profit']
+
+        position['last_reduce_minute'] = minutes_held
+
+        initial_tp = position['initial_take_profit']
+        entry_price = position['entry_price']
+        stop_loss = position['stop_loss']
+        direction = position['direction']
+
+        if direction == 'LONG':
+            # LONG: TP > Entry > SL
+            tp_distance = initial_tp - entry_price  # Dương
+            sl_distance = entry_price - stop_loss  # Dương
+            total_distance = tp_distance + sl_distance
+
+            # Mỗi phút giảm reduce% của total_distance
+            reduction_per_minute = total_distance * (reduce / 100)
+            total_reduction = reduction_per_minute * minutes_held
+
+            # TP mới = Initial TP - total_reduction
+            new_tp = initial_tp - total_reduction
+
+            # Không cho TP thấp hơn SL
+            new_tp = max(new_tp, stop_loss)
+
+        else:  # SHORT
+            # SHORT: SL > Entry > TP
+            tp_distance = entry_price - initial_tp  # Dương (TP < Entry)
+            sl_distance = stop_loss - entry_price  # Dương (SL > Entry)
+            total_distance = tp_distance + sl_distance
+
+            # Mỗi phút giảm reduce%
+            reduction_per_minute = total_distance * (reduce / 100)
+            total_reduction = reduction_per_minute * minutes_held
+
+            # TP mới = Initial TP + total_reduction (tăng về phía SL)
+            new_tp = initial_tp + total_reduction
+
+            # Không cho TP cao hơn SL
+            new_tp = min(new_tp, stop_loss)
+
+        return new_tp
+
     def close_position(self, symbol: str, exit_price: float, reason: str):
-        """Đóng position và tính PnL - Hỗ trợ cả LONG và SHORT"""
+        """Đóng position và tính PnL"""
         if symbol not in self.active_positions:
             return
 
@@ -220,11 +281,9 @@ class TradingStrategy:
 
         # Calculate PnL dựa trên direction
         if direction == 'LONG':
-            # LONG: Profit khi giá tăng
             pnl_percent = ((exit_price - entry_price) / entry_price) * 100
             pnl_usdt = (exit_price - entry_price) * position['quantity']
         else:  # SHORT
-            # SHORT: Profit khi giá giảm
             pnl_percent = ((entry_price - exit_price) / entry_price) * 100
             pnl_usdt = (entry_price - exit_price) * position['quantity']
 
@@ -245,14 +304,21 @@ class TradingStrategy:
         else:
             self.stats['losing_trades'] += 1
 
+        # Tính hold time
+        hold_time = datetime.now() - position['entry_time']
+        hold_minutes = hold_time.total_seconds() / 60
+
         # Save trade
         trade_record = {
             'symbol': symbol,
             'direction': direction,
             'entry_price': entry_price,
             'exit_price': exit_price,
+            'initial_take_profit': position['initial_take_profit'],
+            'final_take_profit': position['take_profit'],
             'entry_time': position['entry_time'],
             'exit_time': datetime.now(),
+            'hold_minutes': hold_minutes,
             'pnl_usdt': pnl_usdt,
             'pnl_percent': pnl_percent,
             'reason': reason,

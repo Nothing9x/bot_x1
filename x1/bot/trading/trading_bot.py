@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-TradingBot - Bot trading với notification
+TradingBot - Bot trading với Reduce TP Strategy
+- Reduce TP: TP giảm dần về entry rồi về SL theo thời gian
 - Telegram notifications cho cả REAL và SIM
 - Cache config values để tránh SQLAlchemy detached session error
 """
@@ -18,11 +19,12 @@ from x1.bot.database.database_models import BotConfig, DatabaseManager, Order, O
 
 class TradingBot:
     """
-    Bot trading với config cụ thể
-    - REAL mode: Trade thật + Telegram notification
-    - SIMULATED mode: Trade giả lập + Telegram notification
+    Bot trading với Reduce TP Strategy
 
-    NOTE: Config values được cache locally để tránh SQLAlchemy detached session error
+    Reduce TP: Mỗi phút, TP giảm reduce% khoảng cách về phía SL
+    - Phút 0: TP = Entry ± TP%
+    - Mỗi phút: TP giảm reduce% × (TP_distance + SL_distance)
+    - Cuối cùng: TP = SL → force close
     """
 
     def __init__(self, bot_config: BotConfig, db_manager: DatabaseManager,
@@ -33,7 +35,7 @@ class TradingBot:
         self.exchange = exchange
         self.chat_id = chat_id
 
-        # ===== CACHE CONFIG VALUES để tránh detached session error =====
+        # ===== CACHE CONFIG VALUES =====
         self.bot_config_id = bot_config.id
         self.bot_name = bot_config.name
         self.direction = bot_config.direction
@@ -44,7 +46,6 @@ class TradingBot:
         self.volume_multiplier = bot_config.volume_multiplier
         self.rsi_threshold = bot_config.rsi_threshold
         self.min_confidence = bot_config.min_confidence
-        self.trailing_stop = bot_config.trailing_stop
         self.min_trend_strength = getattr(bot_config, 'min_trend_strength', 0.0)
         self.require_breakout = getattr(bot_config, 'require_breakout', False)
         self.min_volume_consistency = getattr(bot_config, 'min_volume_consistency', 0.0)
@@ -52,7 +53,11 @@ class TradingBot:
         self.trade_mode = bot_config.trade_mode
         self.is_active = bot_config.is_active
 
-        # Stats (will be updated from DB periodically)
+        # ===== REDUCE TP CONFIG =====
+        # reduce = % giảm mỗi phút (0 = disabled)
+        self.reduce = getattr(bot_config, 'reduce', 0)
+
+        # Stats
         self.total_trades = bot_config.total_trades
         self.winning_trades = bot_config.winning_trades
         self.losing_trades = bot_config.losing_trades
@@ -65,12 +70,16 @@ class TradingBot:
         self.active_trades = {}  # {symbol: trade_id}
         self.pending_orders = {}  # {symbol: order_info}
 
+        # ===== REDUCE TP TRACKING =====
+        # Lưu thông tin reduce cho mỗi trade
+        self.trade_reduce_info = {}  # {symbol: {initial_tp, last_reduce_minute}}
+
     def _get_config_string(self) -> str:
         """Tạo string config ngắn gọn"""
+        reduce_str = f"_R{self.reduce}" if self.reduce > 0 else ""
         return (
-            f"TP{self.take_profit}%_SL{self.stop_loss}%_"
-            f"Vol{self.volume_multiplier}x_Conf{self.min_confidence}%_"
-            f"RSI{self.rsi_threshold}"
+            f"TP{self.take_profit}%_SL{self.stop_loss}%{reduce_str}_"
+            f"Vol{self.volume_multiplier}x_Conf{self.min_confidence}%"
         )
 
     def should_enter(self, signal: Dict) -> bool:
@@ -172,6 +181,13 @@ class TradingBot:
             # Track active trade
             self.active_trades[symbol] = trade_id
 
+            # ===== REDUCE TP: Lưu initial TP =====
+            self.trade_reduce_info[symbol] = {
+                'initial_tp': take_profit,
+                'last_reduce_minute': 0,
+                'entry_time': datetime.now(),
+            }
+
             if self.trade_mode == TradeModeEnum.REAL:
                 await self.place_real_order(trade_id, symbol, entry_price, quantity)
             else:
@@ -180,10 +196,11 @@ class TradingBot:
             # Log
             mode_str = "🔴 REAL" if self.trade_mode == TradeModeEnum.REAL else "🔵 SIM"
             direction_str = "📈 LONG" if self.direction == DirectionEnum.LONG else "📉 SHORT"
+            reduce_str = f" | Reduce: {self.reduce}%/min" if self.reduce > 0 else ""
 
             self.log.i(self.tag,
                        f"[{mode_str}] {direction_str} {symbol} @ ${entry_price:.6f} | "
-                       f"TP: ${take_profit:.6f} | SL: ${stop_loss:.6f}"
+                       f"TP: ${take_profit:.6f} | SL: ${stop_loss:.6f}{reduce_str}"
                        )
 
             # Telegram notification
@@ -209,6 +226,9 @@ class TradingBot:
                 mode_emoji = "🔵"
                 mode_text = "SIM"
 
+            # Reduce info
+            reduce_str = f"⏱️ Reduce: {self.reduce}%/min\n" if self.reduce > 0 else ""
+
             message = (
                 f"{mode_emoji} <b>{mode_text} OPEN {direction}</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
@@ -219,13 +239,13 @@ class TradingBot:
                 f"🎯 TP: ${take_profit:.6f} (+{self.take_profit}%)\n"
                 f"🛑 SL: ${stop_loss:.6f} (-{self.stop_loss}%)\n"
                 f"📦 Size: ${self.position_size_usdt}\n"
+                f"{reduce_str}"
                 f"\n"
                 f"⚙️ <b>Config:</b>\n"
                 f"├ {direction_emoji} {direction}\n"
                 f"├ TP: {self.take_profit}% | SL: {self.stop_loss}%\n"
                 f"├ Vol: {self.volume_multiplier}x | Conf: {self.min_confidence}%\n"
-                f"├ RSI: {self.rsi_threshold} | Trail: {'✅' if self.trailing_stop else '❌'}\n"
-                f"└ Price↑: {self.price_increase_threshold}%\n"
+                f"└ Reduce: {self.reduce}%/min\n"
                 f"\n"
                 f"📊 Signal: Conf={signal.get('confidence', 0)}% | "
                 f"Vol={signal.get('volume_ratio', 0):.1f}x"
@@ -367,6 +387,10 @@ class TradingBot:
                         trade.take_profit = fill_price * (1 - self.take_profit / 100)
                         trade.stop_loss = fill_price * (1 + self.stop_loss / 100)
 
+                    # Update reduce info với TP mới
+                    if symbol in self.trade_reduce_info:
+                        self.trade_reduce_info[symbol]['initial_tp'] = trade.take_profit
+
                 session.commit()
                 session.close()
 
@@ -376,13 +400,15 @@ class TradingBot:
             elif pending['candles_waited'] >= 2:
                 await self.cancel_trade(trade_id, "Order not filled after 2 candles")
                 del self.pending_orders[symbol]
+                if symbol in self.trade_reduce_info:
+                    del self.trade_reduce_info[symbol]
                 self.log.i(self.tag, f"❌ SIM order cancelled for {symbol}")
 
         except Exception as e:
             self.log.e(self.tag, f"Error checking pending order: {e}")
 
     async def check_exit(self, symbol: str, candle: Dict):
-        """Check exit conditions"""
+        """Check exit conditions với Reduce TP"""
         try:
             trade_id = self.active_trades.get(symbol)
             if not trade_id:
@@ -395,20 +421,23 @@ class TradingBot:
                 session.close()
                 return
 
+            # Lưu TP ban đầu để so sánh
+            initial_tp = trade.take_profit
+
             # Update highest/lowest
             if candle['high'] > trade.highest_price:
                 trade.highest_price = candle['high']
-                if self.direction == DirectionEnum.LONG and self.trailing_stop:
-                    new_stop = candle['high'] * (1 - self.stop_loss / 100)
-                    if new_stop > trade.stop_loss:
-                        trade.stop_loss = new_stop
 
             if candle['low'] < trade.lowest_price:
                 trade.lowest_price = candle['low']
-                if self.direction == DirectionEnum.SHORT and self.trailing_stop:
-                    new_stop = candle['low'] * (1 + self.stop_loss / 100)
-                    if new_stop < trade.stop_loss:
-                        trade.stop_loss = new_stop
+
+            # ===== REDUCE TP: Apply reduction =====
+            exit_reason_suffix = ""
+            if self.reduce > 0 and symbol in self.trade_reduce_info:
+                new_tp = self._calculate_reduced_tp(trade, symbol)
+                if new_tp != trade.take_profit:
+                    trade.take_profit = new_tp
+                    exit_reason_suffix = "_REDUCED"
 
             # Check exit
             exit_price = None
@@ -417,20 +446,23 @@ class TradingBot:
             if self.direction == DirectionEnum.LONG:
                 if candle['high'] >= trade.take_profit:
                     exit_price = trade.take_profit
-                    exit_reason = 'TP'
+                    exit_reason = 'TP' + exit_reason_suffix
                 elif candle['low'] <= trade.stop_loss:
                     exit_price = trade.stop_loss
                     exit_reason = 'SL'
-            else:
+            else:  # SHORT
                 if candle['low'] <= trade.take_profit:
                     exit_price = trade.take_profit
-                    exit_reason = 'TP'
+                    exit_reason = 'TP' + exit_reason_suffix
                 elif candle['high'] >= trade.stop_loss:
                     exit_price = trade.stop_loss
                     exit_reason = 'SL'
 
             if exit_price:
                 await self.close_trade(trade, exit_price, exit_reason, session)
+                # Cleanup reduce info
+                if symbol in self.trade_reduce_info:
+                    del self.trade_reduce_info[symbol]
             else:
                 session.commit()
 
@@ -438,6 +470,68 @@ class TradingBot:
 
         except Exception as e:
             self.log.e(self.tag, f"Error checking exit: {e}")
+
+    def _calculate_reduced_tp(self, trade: Trade, symbol: str) -> float:
+        """
+        Tính TP mới sau khi apply reduce
+
+        Logic:
+        - Mỗi phút, TP giảm reduce% của tổng khoảng cách (TP → Entry → SL)
+        - LONG: TP giảm từ trên xuống
+        - SHORT: TP tăng từ dưới lên (về phía SL)
+        """
+        reduce_info = self.trade_reduce_info.get(symbol)
+        if not reduce_info:
+            return trade.take_profit
+
+        # Tính số phút đã hold
+        entry_time = reduce_info.get('entry_time', trade.entry_time)
+        hold_time = datetime.now() - entry_time
+        minutes_held = int(hold_time.total_seconds() / 60)
+
+        # Chỉ reduce mỗi phút một lần
+        if minutes_held <= reduce_info['last_reduce_minute']:
+            return trade.take_profit
+
+        reduce_info['last_reduce_minute'] = minutes_held
+
+        initial_tp = reduce_info['initial_tp']
+        entry_price = trade.entry_price
+        stop_loss = trade.stop_loss
+
+        if self.direction == DirectionEnum.LONG:
+            # LONG: TP > Entry > SL
+            tp_distance = initial_tp - entry_price  # Dương
+            sl_distance = entry_price - stop_loss  # Dương
+            total_distance = tp_distance + sl_distance
+
+            # Mỗi phút giảm reduce% của total_distance
+            reduction_per_minute = total_distance * (self.reduce / 100)
+            total_reduction = reduction_per_minute * minutes_held
+
+            # TP mới = Initial TP - total_reduction
+            new_tp = initial_tp - total_reduction
+
+            # Không cho TP thấp hơn SL
+            new_tp = max(new_tp, stop_loss)
+
+        else:  # SHORT
+            # SHORT: SL > Entry > TP
+            tp_distance = entry_price - initial_tp  # Dương (TP < Entry)
+            sl_distance = stop_loss - entry_price  # Dương (SL > Entry)
+            total_distance = tp_distance + sl_distance
+
+            # Mỗi phút giảm reduce%
+            reduction_per_minute = total_distance * (self.reduce / 100)
+            total_reduction = reduction_per_minute * minutes_held
+
+            # TP mới = Initial TP + total_reduction (tăng về phía SL)
+            new_tp = initial_tp + total_reduction
+
+            # Không cho TP cao hơn SL
+            new_tp = min(new_tp, stop_loss)
+
+        return new_tp
 
     async def close_trade(self, trade: Trade, exit_price: float, reason: str, session):
         """Đóng trade"""
@@ -492,7 +586,7 @@ class TradingBot:
             self.log.i(self.tag,
                        f"{emoji} [{mode_str}] Closed {trade.direction.value} {trade.symbol} | "
                        f"Entry: ${trade.entry_price:.6f} | Exit: ${exit_price:.6f} | "
-                       f"PnL: {pnl_percent:.2f}% (${pnl_usdt:.2f}) | {reason}"
+                       f"PnL: {pnl_percent:.2f}% (${pnl_usdt:.2f}) | {reason} | Hold: {hold_minutes:.1f}min"
                        )
 
             # Telegram notification
@@ -518,21 +612,36 @@ class TradingBot:
                 mode_emoji = "🔵"
                 mode_text = "SIM"
 
+            # WIN/LOSS dựa trên PnL thực tế
             result_emoji = "✅" if pnl_usdt > 0 else "❌"
             result_text = "WIN" if pnl_usdt > 0 else "LOSS"
-            reason_emoji = "🎯" if reason == "TP" else "🛑"
+
+            # Reason emoji và text
+            if 'TP' in reason:
+                reason_emoji = "🎯"
+                if '_REDUCED' in reason:
+                    reason_text = f"Take Profit (Reduced after {hold_minutes:.0f}min)"
+                else:
+                    reason_text = "Take Profit"
+            else:  # SL
+                reason_emoji = "🛑"
+                reason_text = "Stop Loss"
+
+            # Reduce info
+            reduce_str = f"⏱️ Reduce: {self.reduce}%/min\n" if self.reduce > 0 else ""
 
             message = (
                 f"{mode_emoji} {result_emoji} <b>{mode_text} CLOSE - {result_text}</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"🤖 Bot: <b>{self.bot_name}</b>\n"
                 f"🪙 Symbol: <b>{trade.symbol}</b>\n"
-                f"📍 Reason: {reason_emoji} <b>{reason}</b>\n"
+                f"📍 Reason: {reason_emoji} <b>{reason_text}</b>\n"
                 f"\n"
                 f"💰 Entry: ${trade.entry_price:.6f}\n"
                 f"💵 Exit: ${exit_price:.6f}\n"
                 f"📊 PnL: <b>{pnl_percent:+.2f}%</b> (${pnl_usdt:+.2f})\n"
                 f"⏱️ Hold: {hold_minutes:.1f} min\n"
+                f"{reduce_str}"
                 f"\n"
                 f"📈 Price Range:\n"
                 f"├ High: ${trade.highest_price:.6f}\n"
@@ -545,7 +654,7 @@ class TradingBot:
                 f"\n"
                 f"⚙️ {direction_emoji} {direction} | "
                 f"TP{self.take_profit}% SL{self.stop_loss}% "
-                f"Vol{self.volume_multiplier}x"
+                f"R{self.reduce}%"
             )
 
             await self.tele_message.send_message(message, self.chat_id)
@@ -566,6 +675,9 @@ class TradingBot:
 
                 if trade.symbol in self.active_trades:
                     del self.active_trades[trade.symbol]
+
+                if trade.symbol in self.trade_reduce_info:
+                    del self.trade_reduce_info[trade.symbol]
 
                 self.log.i(self.tag, f"Cancelled trade {trade_id}: {reason}")
 
