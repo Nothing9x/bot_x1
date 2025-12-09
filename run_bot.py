@@ -1,7 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Script để chạy MEXC Pump Bot
+Script để chạy Pump Bot
+- Hỗ trợ cả MEXC và Gate.io
+- Chuyển đổi exchange trong bot_config.py
+
 Đặt file này ở root folder: Mexc_Bot/x1/
 Chạy: python run_bot.py
 """
@@ -14,14 +17,22 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import asyncio
 import traceback
-from x1.bot.mexc_pump_bot import MexcPumpBot
+
+# Import config để hiển thị exchange đang dùng
+from x1.bot.config.bot_config import BotConfig
+
+# Import bot từ pump_bot.py (hỗ trợ cả MEXC và Gate)
+from x1.bot.pump_bot import MexcPumpBot
 
 
 async def main():
     """Main entry point"""
 
+    exchange_name = BotConfig.get_exchange_name()
+
     print("=" * 70)
-    print("🚀 MEXC PUMP BOT - Strategy Backtesting & Production Trading")
+    print(f"🚀 PUMP BOT - Strategy Backtesting & Production Trading")
+    print(f"📊 Exchange: {exchange_name}")
     print("=" * 70)
 
     # Config
@@ -29,8 +40,13 @@ async def main():
     API_SECRET = None  # Nếu muốn trade REAL, điền API secret
 
     print("\n📋 Configuration:")
+    print(f"  Exchange: {exchange_name}")
     print(f"  API Key: {'✅ Set' if API_KEY else '❌ Not set (Backtest only)'}")
     print(f"  Mode: {'Full System' if API_KEY else 'Backtest Only'}")
+
+    if BotConfig.is_gate():
+        print(f"  Gate Testnet: {'✅ Yes' if BotConfig.GATE_TESTNET else '❌ No (Mainnet)'}")
+
     print()
 
     # Create bot
