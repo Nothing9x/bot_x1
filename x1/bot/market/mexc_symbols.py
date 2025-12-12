@@ -13,7 +13,7 @@ from x1.bot.model.symbol import Symbol
 from x1.bot.utils import Utils
 from x1.bot.utils.LoggerWrapper import LoggerWrapper
 from x1.bot.utils.black_list_symbol import BLACK_LIST_SYMBOL
-from x1.bot.config.bot_config import BotConfig
+from x1.bot.config.exchange_config import ExchangeConfig
 
 MEXC_CONTRACT_DETAIL_URL = "https://contract.mexc.com/api/v1/contract/detail"
 
@@ -34,7 +34,7 @@ def init_mexc_symbols(log: LoggerWrapper, proxy: str = None) -> list:
 
     # Dùng proxy từ config nếu không được truyền vào
     if proxy is None:
-        proxy = BotConfig.PROXY
+        proxy = ExchangeConfig.PROXY
 
     try:
         log.i(tag, "📥 Loading MEXC symbols...")

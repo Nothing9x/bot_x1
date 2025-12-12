@@ -17,7 +17,7 @@ import requests
 
 from x1.bot.ai.pump_detector import PumpDetector
 from x1.bot.ai.strategy_manager import StrategyManager
-from x1.bot.config.bot_config import BotConfig, ExchangeType
+from x1.bot.config.exchange_config import ExchangeConfig, ExchangeType
 from x1.bot.market.socket_factory import SocketFactory
 from x1.bot.model.symbol import Symbol
 from x1.bot.notification.notification_manager import TelegramMessageQueue
@@ -58,19 +58,19 @@ class MexcPumpBot:
         # ✨ THÊM ATTRIBUTE - Config Auto Updater
         self.config_updater = None
 
-        bot_token = BotConfig.TELEGRAM_BOT_TOKEN
-        self.admin_proxy = proxy or BotConfig.PROXY
+        bot_token = ExchangeConfig.TELEGRAM_BOT_TOKEN
+        self.admin_proxy = proxy or ExchangeConfig.PROXY
 
         self.tag = "PumpBot"
-        self.chat_id = BotConfig.TELEGRAM_CHAT_ID
+        self.chat_id = ExchangeConfig.TELEGRAM_CHAT_ID
 
-        self.log = Log().init('main', BotConfig.LOG_LEVEL)
+        self.log = Log().init('main', ExchangeConfig.LOG_LEVEL)
 
         # Setup Telegram notification
         self.tele_message = TelegramMessageQueue(log=self.log, bot_token=bot_token)
 
         # ========== DYNAMIC SOCKET CREATION ==========
-        # Tạo market socket dựa trên config (MEXC hoặc GATE)
+        # Tạo exchange socket dựa trên config (MEXC hoặc GATE)
         self.market_socket = SocketFactory.create_socket(
             log=self.log,
             proxy=self.admin_proxy,
@@ -95,12 +95,12 @@ class MexcPumpBot:
         self.total_signals_detected = 0
 
         # Log exchange being used
-        self.log.i(self.tag, f"📊 Using exchange: {BotConfig.get_exchange_name()}")
+        self.log.i(self.tag, f"📊 Using exchange: {ExchangeConfig.get_exchange_name()}")
 
     async def initialize(self):
         """Khởi tạo bot"""
         try:
-            exchange_name = BotConfig.get_exchange_name()
+            exchange_name = ExchangeConfig.get_exchange_name()
             self.log.i(self.tag, f"🚀 Initializing Pump Bot with {exchange_name} + BotManager...")
 
             self.start_time = datetime.now()
@@ -123,7 +123,7 @@ class MexcPumpBot:
             self.configure_detector()
 
             # Generate strategies for backtesting
-            num_strategies = BotConfig.NUM_STRATEGIES
+            num_strategies = ExchangeConfig.NUM_STRATEGIES
             self.strategy_manager.generate_strategies(max_strategies=num_strategies)
 
             # Initialize Database & BotManager
@@ -236,7 +236,7 @@ class MexcPumpBot:
 
     def configure_detector(self):
         """Cấu hình pump detector - ĐIỀU KIỆN DỄ để vào NHIỀU lệnh"""
-        self.pump_detector.config = BotConfig.PUMP_CONFIG.copy()
+        self.pump_detector.config = ExchangeConfig.PUMP_CONFIG.copy()
         self.pump_detector.config.update({
             'rsi_period': 14,
             'rsi_overbought': 50,
@@ -322,7 +322,7 @@ class MexcPumpBot:
                 asyncio.create_task(self.config_updater.start())
                 self.log.i(self.tag, "✅ Config Auto Updater started")
 
-            exchange_name = BotConfig.get_exchange_name()
+            exchange_name = ExchangeConfig.get_exchange_name()
             self.log.i(self.tag, f"✅ Bot is running with {exchange_name}!")
             await self.tele_message.send_message(
                 f"✅ Bot is running!\n"
@@ -437,7 +437,7 @@ class MexcPumpBot:
                 runtime = datetime.now() - self.start_time
                 hours = runtime.total_seconds() / 3600
 
-                exchange_name = BotConfig.get_exchange_name()
+                exchange_name = ExchangeConfig.get_exchange_name()
 
                 # Get quick stats
                 total_strategies = len(self.strategy_manager.strategies)
@@ -563,7 +563,7 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        exchange_name = BotConfig.get_exchange_name()
+        exchange_name = ExchangeConfig.get_exchange_name()
         print("=" * 50)
         print(f"🚀 Pump Bot - Strategy Backtesting Mode")
         print(f"📊 Exchange: {exchange_name}")

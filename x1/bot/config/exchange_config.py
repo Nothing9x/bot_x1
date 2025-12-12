@@ -17,7 +17,7 @@ class ExchangeType(Enum):
     GATE = "gate"
 
 
-class BotConfig:
+class ExchangeConfig:
     """
     Configuration cho bot
     Sửa các giá trị ở đây để thay đổi behavior

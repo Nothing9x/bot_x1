@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 Socket Factory
-- Tạo market socket dựa trên config
+- Tạo exchange socket dựa trên config
 - Hỗ trợ MEXC và Gate.io
 """
 
 from typing import List
 
-from x1.bot.config.bot_config import BotConfig, ExchangeType
+from x1.bot.config.exchange_config import ExchangeConfig, ExchangeType
 from x1.bot.market.i_market_socket import IMarketSocket
 from x1.bot.model.symbol import Symbol
 from x1.bot.notification.notification_manager import TelegramMessageQueue
@@ -17,7 +17,7 @@ from x1.bot.utils.LoggerWrapper import LoggerWrapper
 
 class SocketFactory:
     """
-    Factory class để tạo market socket
+    Factory class để tạo exchange socket
     """
 
     @staticmethod
@@ -29,7 +29,7 @@ class SocketFactory:
             exchange: ExchangeType = None
     ) -> IMarketSocket:
         """
-        Tạo market socket dựa trên exchange type
+        Tạo exchange socket dựa trên exchange type
 
         Args:
             log: Logger instance
@@ -42,7 +42,7 @@ class SocketFactory:
             IMarketSocket: Market socket instance
         """
         if exchange is None:
-            exchange = BotConfig.EXCHANGE
+            exchange = ExchangeConfig.EXCHANGE
 
         if exchange == ExchangeType.MEXC:
             from x1.bot.market.mexc_socket import MexcSocket
@@ -59,7 +59,7 @@ class SocketFactory:
                 proxy=proxy,
                 tele_message=tele_message,
                 chat_id=chat_id,
-                testnet=BotConfig.GATE_TESTNET
+                testnet=ExchangeConfig.GATE_TESTNET
             )
         else:
             raise ValueError(f"Unknown exchange type: {exchange}")
@@ -77,17 +77,17 @@ class SocketFactory:
             List[Symbol]: Danh sách symbols
         """
         if exchange is None:
-            exchange = BotConfig.EXCHANGE
+            exchange = ExchangeConfig.EXCHANGE
 
         if exchange == ExchangeType.MEXC:
             from x1.bot.market.mexc_symbols import init_mexc_symbols
-            return init_mexc_symbols(log=log, proxy=BotConfig.PROXY)
+            return init_mexc_symbols(log=log, proxy=ExchangeConfig.PROXY)
 
         elif exchange == ExchangeType.GATE:
             from x1.bot.market.gate_socket import GateSocket
             return GateSocket.init_gate_symbols(
                 log=log,
-                testnet=BotConfig.GATE_TESTNET
+                testnet=ExchangeConfig.GATE_TESTNET
             )
         else:
             raise ValueError(f"Unknown exchange type: {exchange}")
@@ -95,4 +95,4 @@ class SocketFactory:
     @staticmethod
     def get_exchange_name() -> str:
         """Lấy tên exchange hiện tại"""
-        return BotConfig.get_exchange_name()
+        return ExchangeConfig.get_exchange_name()

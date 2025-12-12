@@ -278,7 +278,7 @@ class TradingBot:
                 try:
                     result = self.exchange.create_order(
                         symbol=symbol,
-                        type='market',
+                        type='exchange',
                         side=side,
                         amount=quantity
                     )
