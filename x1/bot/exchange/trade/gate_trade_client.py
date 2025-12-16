@@ -12,7 +12,7 @@ from gate_api import FuturesPositionCrossMode
 from gate_api.exceptions import GateApiException, ApiException
 from urllib3 import make_headers
 
-from x1.bot.model.config.bot_live_config import BotLiveConfig
+from x1.bot.database.database_models import BotConfig
 from x1.bot.notification.notification_manager import TelegramMessageQueue
 from x1.bot.exchange.trade.i_trade_client import ITradeClient
 from x1.bot.exchange.trade.trade_side import TradeSide
@@ -31,7 +31,7 @@ class GateTradeClient(ITradeClient):
 
     def __init__(
             self,
-            bot: BotLiveConfig,
+            bot: BotConfig,
             telegramMessage: TelegramMessageQueue,
             log: LoggerWrapper,
             trade_callback,

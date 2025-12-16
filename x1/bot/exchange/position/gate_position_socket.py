@@ -8,8 +8,8 @@ import hashlib
 import aiohttp
 import traceback
 
+from x1.bot.database.database_models import BotConfig
 from x1.bot.exchange.position.i_position_socket import IPositionSocket
-from x1.bot.model.config.bot_live_config import BotLiveConfig
 from x1.bot.model.reposonse.gate_order_response import GateOrderResponse
 from x1.bot.utils import Utils
 from x1.bot.utils.LoggerWrapper import LoggerWrapper
@@ -19,7 +19,7 @@ GATE_WS_URL_TEST_NET = "wss://fx-ws-testnet.gateio.ws/v4/ws/usdt"
 
 
 class GatePositionSocket(IPositionSocket):
-    def __init__(self, bot: BotLiveConfig, log: LoggerWrapper, position_callback, trade_callback):
+    def __init__(self, bot: BotConfig, log: LoggerWrapper, position_callback, trade_callback):
         self.tag = "GatePositionSocket"
         self.log = log
         self.bot = bot

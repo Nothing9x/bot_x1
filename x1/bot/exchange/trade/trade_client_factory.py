@@ -1,10 +1,9 @@
-from com.BotConfig import BotConfig
-from com.xbot.mexc.bot.gate_trade_client import GateTradeClient
-from com.xbot.mexc.bot.i_trade_client import ITradeClient
-from com.xbot.mexc.bot.mexc_trade_client import MexcTradeClient
-from com.xbot.mexc.market.model.supported_exchange_name import SupportedExchangeName
-from com.xbot.mexc.notification.notification_manager import TelegramMessageQueue
-from com.xbot.mexc.utils.LoggerWrapper import LoggerWrapper
+from x1.bot.config.exchange_config import ExchangeConfig
+from x1.bot.database.database_models import BotConfig
+from x1.bot.exchange.trade.gate_trade_client import GateTradeClient
+from x1.bot.exchange.trade.i_trade_client import ITradeClient
+from x1.bot.notification.notification_manager import TelegramMessageQueue
+from x1.bot.utils.LoggerWrapper import LoggerWrapper
 
 
 class TradeClientFactory:
@@ -14,7 +13,7 @@ class TradeClientFactory:
         exchange_name = exchange_name.upper()
         log.i("TradeClientFactory", f"Creating TradeClient for exchange: {exchange_name}")
 
-        if exchange_name == SupportedExchangeName.GATE:
+        if exchange_name == ExchangeConfig.EXCHANGE.GATE:
             return GateTradeClient(bot, telegramMessage, log, trade_callback)
         else:
-            return MexcTradeClient(bot, telegramMessage, log, trade_callback)
+            return GateTradeClient(bot, telegramMessage, log, trade_callback)

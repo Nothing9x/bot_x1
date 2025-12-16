@@ -2,7 +2,6 @@
 .venv
 *.log
 /log
-config.py
 *.csv
 test.py
 bot/*
