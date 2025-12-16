@@ -42,14 +42,13 @@ class RealBotLive:
     """
 
     def __init__(self, account_config: RealAccountConfig, db_manager, log,
-                 tele_message=None, symbols: List = None):
+                 tele_message=None):
         """
         Args:
             account_config: RealAccountConfig từ config_loader
             db_manager: DatabaseManager instance
             log: Logger instance
             tele_message: TelegramMessageQueue (optional)
-            symbols: List[Symbol] từ init_symbols - chứa thông tin ps, leverage của mỗi symbol
         """
         self.account_config = account_config
         self.db_manager = db_manager
@@ -59,10 +58,6 @@ class RealBotLive:
         # Telegram
         self.tele_message = tele_message
         self.chat_id = account_config.chat_id
-
-        # Symbols info - để lookup ps, leverage
-        self.symbols = symbols or []
-        self.symbol_map: Dict[str, any] = {s.symbol: s for s in self.symbols}
 
         # Trade client (sẽ tạo trong start())
         self.trade_client = None
@@ -144,7 +139,7 @@ class RealBotLive:
     async def _create_trade_client(self):
         """Tạo trade client từ TradeClientFactory"""
         try:
-            from x1.bot.trading.trade_client_factory import TradeClientFactory
+            from x1.bot.exchange.trade.trade_client_factory import TradeClientFactory
 
             self.trade_client = TradeClientFactory.create(
                 exchange_name=self.account_config.exchange,
@@ -308,7 +303,6 @@ class RealBotLive:
                         symbol=symbol,
                         side=side,
                         quantity=quantity,
-                        price=price,
                         take_profit=take_profit,
                         stop_loss=stop_loss
                     )
@@ -343,35 +337,34 @@ class RealBotLive:
         except Exception as e:
             self.log.e(self.tag, f"Error entering position: {e}\n{traceback.format_exc()}")
 
-    async def _place_order(self, symbol: str, side: str, quantity: float, price: float = 0,
+    async def _place_order(self, symbol: str, side: str, quantity: float,
                            take_profit: float = None, stop_loss: float = None) -> bool:
-        """Place order qua trade client sử dụng send_order"""
+        """Place order qua trade client"""
         try:
             if not self.trade_client:
                 self.log.e(self.tag, "Trade client not initialized")
                 return False
 
-            # Lấy thông tin symbol (ps, leverage)
-            symbol_info = self.symbol_map.get(symbol)
-            ps = symbol_info.price_scale if symbol_info else 1
-            leverage = symbol_info.max_leverage if symbol_info else self.account_config.leverage
-
-            # Convert side: 'buy' -> 1, 'sell' -> 2 (hoặc theo convention của bạn)
-            side_value = 1 if side == 'buy' else 2
-
-            # Gọi send_order
-            await self.trade_client.send_order(
-                orderId=-1,
-                symbol=symbol,
-                price=price,
-                quantity=quantity,
-                side=side_value,
-                leverage=leverage,
-                ps=ps,
-                take_profit=take_profit,
-                stop_loss=stop_loss,
-                tag=self.tag
-            )
+            # Gọi method của trade client - adapt theo interface của bạn
+            if hasattr(self.trade_client, 'open_position'):
+                await self.trade_client.sen(
+                    symbol=symbol,
+                    side=side,
+                    quantity=quantity,
+                    take_profit=take_profit,
+                    stop_loss=stop_loss
+                )
+            elif hasattr(self.trade_client, 'create_order'):
+                await self.trade_client.create_order(
+                    symbol=symbol,
+                    side=side,
+                    amount=quantity,
+                    tp=take_profit,
+                    sl=stop_loss
+                )
+            else:
+                self.log.w(self.tag, "Trade client doesn't have expected methods")
+                return False
 
             return True
 

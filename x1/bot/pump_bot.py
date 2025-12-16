@@ -294,8 +294,6 @@ class MexcPumpBot:
                         account_config=account,
                         db_manager=self.db_manager,
                         log=self.log,
-                        tele_message=self.tele_message,
-                        symbols=self.symbols,
                     )
 
                     # Start the bot
@@ -741,8 +739,6 @@ class MexcPumpBot:
                 account_config=account,
                 db_manager=self.db_manager,
                 log=self.log,
-                tele_message=self.tele_message,
-                symbols=self.symbols,
             )
 
             await real_bot.start()
