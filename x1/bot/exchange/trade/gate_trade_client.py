@@ -12,10 +12,10 @@ from gate_api import FuturesPositionCrossMode
 from gate_api.exceptions import GateApiException, ApiException
 from urllib3 import make_headers
 
+from x1.bot.model.config.bot_live_config import BotLiveConfig
 from x1.bot.notification.notification_manager import TelegramMessageQueue
 from x1.bot.exchange.trade.i_trade_client import ITradeClient
 from x1.bot.exchange.trade.trade_side import TradeSide
-from x1.bot.trading.config_loader import RealAccountConfig
 from x1.bot.utils import Utils
 from x1.bot.utils.LoggerWrapper import LoggerWrapper
 
@@ -31,7 +31,7 @@ class GateTradeClient(ITradeClient):
 
     def __init__(
             self,
-            bot: RealAccountConfig,
+            bot: BotLiveConfig,
             telegramMessage: TelegramMessageQueue,
             log: LoggerWrapper,
             trade_callback,
@@ -48,13 +48,13 @@ class GateTradeClient(ITradeClient):
 
         if self.IS_DEV:
             cfg = gate_api.Configuration(host=self.TEST_NET_HOST,
-                                         key=bot.api_key,
-                                         secret=bot.secret_key)
+                                         key=bot.API_KEY,
+                                         secret=bot.SECRET_KEY)
         else:
-            cfg = gate_api.Configuration(key=self.bot.api_key,
-                                         secret=self.bot.secret_key)
-        if self.bot.proxy:
-            auth_part, addr_part = self.bot.proxy.split("@")
+            cfg = gate_api.Configuration(key=self.bot.API_KEY,
+                                         secret=self.bot.SECRET_KEY)
+        if self.bot.PROXY:
+            auth_part, addr_part = self.bot.PROXY.split("@")
             user, pwd = auth_part.split(":", 1)
             host, port = addr_part.split(":", 1)
             cfg.proxy = f"http://{host}:{port}"
@@ -94,7 +94,7 @@ class GateTradeClient(ITradeClient):
             tag: str = "",
     ):
         if leverage is None:
-            leverage = self.bot.leverage
+            leverage = self.bot.LEVERAGE
 
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         await self._queue.put(
@@ -119,7 +119,7 @@ class GateTradeClient(ITradeClient):
                 f"{tag} TIMEOUT symbol={symbol} price={price} qty={quantity} side={side}"
             )
             self.log.e(self.tag, msg)
-            await self.tele.send_message(msg, self.bot.chat_id)
+            await self.tele.send_message(msg, self.bot.CHAT_ID)
             return None
 
     # ──────────────────────────── INTERNAL WORKER ────────────────────
@@ -229,7 +229,7 @@ class GateTradeClient(ITradeClient):
                 return await self.place_order(
                     symbol, price, quantity, side, leverage, ps, take_profit, stop_loss, retry_count - 1
                 )
-            await self.tele.send_message(f"Gate place order error: {e}", self.bot.chat_id)
+            await self.tele.send_message(f"Gate place order error: {e}", self.bot.CHAT_ID)
             return -1
 
     async def _create_tp_sl(
@@ -276,10 +276,10 @@ class GateTradeClient(ITradeClient):
             body = getattr(e, "body", None)
             await self.tele.send_message(
                 f"⚠️ Failed to place initial SL. Please open the web/app to handle this case:\n{body or e}",
-                self.bot.chat_id
+                self.bot.CHAT_ID
             )
 
-            if self.bot.auto_place_sl_market:
+            if self.bot.AUTO_PLACE_SL_MARKET:
                 try:
                     order = gate_api.FuturesOrder(
                         contract=contract,
@@ -295,11 +295,11 @@ class GateTradeClient(ITradeClient):
                     )
                     self.log.e(self.tag, f"✅ Retry place SL succeeded: closed position at exchange. Order ID: {res.id}")
                     await self.tele.send_message(f"✅ Retry place SL succeeded: closed position at exchange.",
-                                                 self.bot.chat_id)
+                                                 self.bot.CHAT_ID)
                     return res.id
                 except Exception as ex:
                     self.log.e(self.tag, f"❌ Retry close exchange failed: {ex}")
-                    await self.tele.send_message(f"❌ Retry close exchange failed: {ex}", self.bot.chat_id)
+                    await self.tele.send_message(f"❌ Retry close exchange failed: {ex}", self.bot.CHAT_ID)
         return -1
 
     async def cancel_order(self, oid: int):
@@ -318,7 +318,7 @@ class GateTradeClient(ITradeClient):
             if label == "ORDER_NOT_FOUND":
                 return oid
             self.log.e(self.tag, f"Cancel error: {e}")
-            await self.tele.send_message(f"Cancel_order {oid}, error: {e}", self.bot.chat_id)
+            await self.tele.send_message(f"Cancel_order {oid}, error: {e}", self.bot.CHAT_ID)
             return -1
 
     # ──────────────────────────── UTILS ─────────────────────────────
@@ -513,4 +513,4 @@ class GateTradeClient(ITradeClient):
             msgs.append("⚠️ Details:")
             msgs.extend(errs)
 
-        await self.tele.send_message("\n".join(msgs), self.bot.chat_id)
+        await self.tele.send_message("\n".join(msgs), self.bot.CHAT_ID)

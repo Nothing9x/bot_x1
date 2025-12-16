@@ -13,8 +13,8 @@ from enum import Enum
 
 class ExchangeType(Enum):
     """Exchange type enum"""
-    MEXC = "MEXC"
-    GATE = "GATE"
+    MEXC = "mexc"
+    GATE = "gate"
 
 
 class ExchangeConfig:

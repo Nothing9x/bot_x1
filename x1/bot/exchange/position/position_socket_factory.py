@@ -1,7 +1,7 @@
 from x1.bot.config.exchange_config import ExchangeConfig
 from x1.bot.exchange.position.gate_position_socket import GatePositionSocket
 from x1.bot.exchange.position.i_position_socket import IPositionSocket
-from x1.bot.trading.config_loader import RealAccountConfig
+from x1.bot.model.config.bot_live_config import BotLiveConfig
 from x1.bot.utils.LoggerWrapper import LoggerWrapper
 
 
@@ -11,7 +11,7 @@ class MexcPositionSocket:
 
 class PositionSocketFactory:
     @staticmethod
-    def create(exchange: str, bot: RealAccountConfig, log: LoggerWrapper,
+    def create(exchange: str, bot: BotLiveConfig, log: LoggerWrapper,
                position_callback, trade_callback) -> IPositionSocket:
         exchange = exchange.upper()
         if exchange == ExchangeConfig.EXCHANGE.MEXC:

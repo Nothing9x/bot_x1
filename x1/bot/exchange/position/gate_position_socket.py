@@ -9,9 +9,8 @@ import aiohttp
 import traceback
 
 from x1.bot.exchange.position.i_position_socket import IPositionSocket
+from x1.bot.model.config.bot_live_config import BotLiveConfig
 from x1.bot.model.reposonse.gate_order_response import GateOrderResponse
-from x1.bot.model.reposonse.gate_position_response import GatePositionResponse
-from x1.bot.trading.config_loader import RealAccountConfig
 from x1.bot.utils import Utils
 from x1.bot.utils.LoggerWrapper import LoggerWrapper
 
@@ -20,7 +19,7 @@ GATE_WS_URL_TEST_NET = "wss://fx-ws-testnet.gateio.ws/v4/ws/usdt"
 
 
 class GatePositionSocket(IPositionSocket):
-    def __init__(self, bot: RealAccountConfig, log: LoggerWrapper, position_callback, trade_callback):
+    def __init__(self, bot: BotLiveConfig, log: LoggerWrapper, position_callback, trade_callback):
         self.tag = "GatePositionSocket"
         self.log = log
         self.bot = bot
@@ -48,10 +47,10 @@ class GatePositionSocket(IPositionSocket):
             enable = True
             while True:
                 try:
-                    if self.bot.proxy == "":
+                    if self.bot.PROXY == "":
                         connector = None
                     else:
-                        connector = ProxyConnector.from_url(f"http://{self.bot.proxy}")
+                        connector = ProxyConnector.from_url(f"http://{self.bot.PROXY}")
                     self.log.d(self.tag, "✅ Connecting to Gate.io Position WebSocket")
                     async with aiohttp.ClientSession(connector=connector) as session:
                         async with session.ws_connect(GATE_WS_URL) as ws:
@@ -111,7 +110,7 @@ class GatePositionSocket(IPositionSocket):
         current_time = int(time.time())
         sign_msg = f"api\nfutures.login\n\n{current_time}"
         sign = hmac.new(
-            self.bot.secret_key.encode(),
+            self.bot.SECRET_KEY.encode(),
             sign_msg.encode(),
             hashlib.sha512
         ).hexdigest()
@@ -121,7 +120,7 @@ class GatePositionSocket(IPositionSocket):
             "channel": "futures.login",
             "event": "api",
             "payload": {
-                "api_key": self.bot.api_key,
+                "api_key": self.bot.API_KEY,
                 "signature": sign,
                 "timestamp": str(current_time),
                 "req_id": f"{current_time}‑login"
@@ -134,7 +133,7 @@ class GatePositionSocket(IPositionSocket):
         for ch in ("futures.orders", "futures.positions"):
             ts = int(time.time())
             sign_msg = f"channel={ch}&event=subscribe&time={ts}"
-            sign = hmac.new(self.bot.secret_key.encode(), sign_msg.encode(), hashlib.sha512).hexdigest()
+            sign = hmac.new(self.bot.SECRET_KEY.encode(), sign_msg.encode(), hashlib.sha512).hexdigest()
             await self.ws.send_str(json.dumps({
                 "time": ts,
                 "channel": ch,
@@ -142,7 +141,7 @@ class GatePositionSocket(IPositionSocket):
                 "payload": ["!all"],
                 "auth": {
                     "method": "api_key",
-                    "KEY": self.bot.api_key,
+                    "KEY": self.bot.API_KEY,
                     "SIGN": sign
                 }
             }))

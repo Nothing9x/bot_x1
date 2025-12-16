@@ -2,13 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 Pump Trading Bot
-Main bot với Backtest + Production Trading + Real Trading
+Main bot với Backtest + Production Trading
 - Hỗ trợ cả MEXC và Gate.io qua config
-- Real bots follow best strategy từ database
 """
 
 import asyncio
-import os
 import time
 import traceback
 from datetime import datetime
@@ -43,32 +41,15 @@ try:
 except ImportError:
     CONFIG_UPDATER_AVAILABLE = False
 
-# ✨ THÊM IMPORT - Real Trading
-try:
-    from x1.bot.trading.config_loader import ConfigLoader
-    from x1.bot.trading.real_bot_live import RealBotLive
-
-    REAL_TRADING_AVAILABLE = True
-except ImportError:
-    REAL_TRADING_AVAILABLE = False
-
 
 class MexcPumpBot:
     """
     Bot phát hiện pump và backtest strategies để tìm config tốt nhất
     - Hỗ trợ cả MEXC và Gate.io thông qua BotConfig
-    - Real bots trade thật follow best strategy
     """
 
-    def __init__(self, api_key: str = None, api_secret: str = None, proxy=None,
-                 real_accounts_path: str = None):
-        """
-        Args:
-            api_key: API key (optional)
-            api_secret: API secret (optional)
-            proxy: Proxy string (optional)
-            real_accounts_path: Path to real_accounts.json config file
-        """
+    def __init__(self, api_key: str = None, api_secret: str = None, proxy=None):
+
         self.db_manager = None
         self.bot_manager = None
         # ✨ THÊM ATTRIBUTES - PnL Tracking
@@ -76,10 +57,6 @@ class MexcPumpBot:
         self.enhanced_strat_mgr = None
         # ✨ THÊM ATTRIBUTE - Config Auto Updater
         self.config_updater = None
-        # ✨ THÊM ATTRIBUTES - Real Trading
-        self.config_loader = None
-        self.real_bots: List[RealBotLive] = [] if REAL_TRADING_AVAILABLE else []
-        self.real_accounts_path = real_accounts_path or "config/real_accounts.json"
 
         bot_token = ExchangeConfig.TELEGRAM_BOT_TOKEN
         self.admin_proxy = proxy or ExchangeConfig.PROXY
@@ -205,26 +182,16 @@ class MexcPumpBot:
                 else:
                     self.log.w(self.tag, "⚠️ Config updater not available")
 
-                # ✨ THÊM - INITIALIZE REAL TRADING
-                await self._init_real_trading()
-
                 bot_stats = self.bot_manager.get_stats()
 
-                # Build init message
-                init_msg = (
+                await self.tele_message.send_message(
                     f"✅ Initialization complete\n"
                     f"📊 Exchange: {exchange_name}\n"
                     f"📈 Backtest: {num_strategies} strategies\n"
-                    f"🤖 Production: {bot_stats['total_bots']} bots "
-                    f"({bot_stats['real_bots']} REAL, {bot_stats['simulated_bots']} SIM)\n"
-                    f"💰 Monitoring {len(self.symbols)} symbols"
+                    f"🤖 Production: {bot_stats['total_bots']} bots ({bot_stats['real_bots']} REAL, {bot_stats['simulated_bots']} SIM)\n"
+                    f"💰 Monitoring {len(self.symbols)} symbols",
+                    self.chat_id
                 )
-
-                # Add real bots info
-                if self.real_bots:
-                    init_msg += f"\n🔴 Real Trading: {len(self.real_bots)} bot(s) active"
-
-                await self.tele_message.send_message(init_msg, self.chat_id)
 
             except ImportError as e:
                 self.log.w(self.tag, f"⚠️ BotManager not available (missing modules): {e}")
@@ -250,11 +217,7 @@ class MexcPumpBot:
             if self.bot_manager:
                 self.market_socket.register_callback(self.bot_manager.on_candle_update)
 
-            # 4. ✨ THÊM - Real bots nhận candles (price updates)
-            if self.real_bots:
-                self.market_socket.register_callback(self._on_candle_for_real_bots)
-
-            # 5. Pump signal → StrategyManager (backtest) + BotManager (production)
+            # 4. Pump signal → StrategyManager (backtest) + BotManager (production)
             self.pump_detector.set_on_pump_detected(self.on_pump_signal_detected)
 
             self.log.i(self.tag, f"✅ Bot initialized successfully with {exchange_name}")
@@ -263,67 +226,6 @@ class MexcPumpBot:
             self.log.e(self.tag, f"❌ Error initializing bot: {e}\n{traceback.format_exc()}")
             await self.tele_message.send_message(f"❌ Bot initialization failed: {e}", self.chat_id)
             raise
-
-    # ✨ THÊM METHOD - Initialize Real Trading
-    async def _init_real_trading(self):
-        """Initialize Real Trading từ config file"""
-        if not REAL_TRADING_AVAILABLE:
-            self.log.w(self.tag, "⚠️ Real trading modules not available")
-            return
-
-        try:
-            # Check if config file exists
-            if not os.path.exists(self.real_accounts_path):
-                self.log.w(self.tag, f"⚠️ Real accounts config not found: {self.real_accounts_path}")
-                return
-
-            # Load configs
-            self.config_loader = ConfigLoader(self.real_accounts_path)
-            active_accounts = self.config_loader.get_active_accounts()
-
-            if not active_accounts:
-                self.log.w(self.tag, "⚠️ No active accounts in config")
-                return
-
-            self.log.i(self.tag, f"📥 Loading {len(active_accounts)} real account(s)...")
-
-            # Create RealBotLive for each account
-            for account in active_accounts:
-                try:
-                    real_bot = RealBotLive(
-                        account_config=account,
-                        db_manager=self.db_manager,
-                        log=self.log,
-                    )
-
-                    # Start the bot
-                    await real_bot.start()
-
-                    self.real_bots.append(real_bot)
-
-                    self.log.i(self.tag,
-                               f"✅ Real bot started: {account.account_id} | "
-                               f"Exchange: {account.exchange} | "
-                               f"Chat: {account.chat_id}"
-                               )
-
-                except Exception as e:
-                    self.log.e(self.tag, f"❌ Error starting real bot {account.account_id}: {e}")
-
-            self.log.i(self.tag, f"✅ {len(self.real_bots)} real bot(s) started")
-
-        except Exception as e:
-            self.log.e(self.tag, f"Error initializing real trading: {e}")
-
-    # ✨ THÊM METHOD - Forward candles to real bots
-    async def _on_candle_for_real_bots(self, symbol: str, interval: str, candle: Dict):
-        """Forward candle updates to real bots for TP/SL/Reduce checking"""
-        try:
-            price = candle.get('close', candle.get('c', 0))
-            for real_bot in self.real_bots:
-                await real_bot.on_price_update(symbol, price, candle)
-        except Exception as e:
-            self.log.e(self.tag, f"Error forwarding candle to real bots: {e}")
 
     def init_symbols(self) -> List[Symbol]:
         """
@@ -422,17 +324,12 @@ class MexcPumpBot:
 
             exchange_name = ExchangeConfig.get_exchange_name()
             self.log.i(self.tag, f"✅ Bot is running with {exchange_name}!")
-
-            # Build running message
-            running_msg = (
+            await self.tele_message.send_message(
                 f"✅ Bot is running!\n"
                 f"📊 Exchange: {exchange_name}\n"
-                f"🔍 Detecting pumps and backtesting strategies..."
+                f"🔍 Detecting pumps and backtesting strategies...",
+                self.chat_id
             )
-            if self.real_bots:
-                running_msg += f"\n🔴 Real bots: {len(self.real_bots)} active"
-
-            await self.tele_message.send_message(running_msg, self.chat_id)
 
             # Keep running
             while True:
@@ -448,7 +345,6 @@ class MexcPumpBot:
         Gửi signal cho:
         1. StrategyManager (backtest)
         2. BotManager (production trading) - nếu có
-        3. ✨ Real bots (real trading) - nếu có
         """
         try:
             symbol = signal['symbol']
@@ -497,10 +393,6 @@ class MexcPumpBot:
             if self.bot_manager:
                 await self.bot_manager.on_signal(signal)
 
-            # 3. ✨ THÊM - Gửi cho Real bots
-            for real_bot in self.real_bots:
-                await real_bot.on_pump_signal(signal)
-
             # DEBUG: Log progress
             if self.total_signals_detected % 10 == 0:
                 # Backtest stats
@@ -518,12 +410,6 @@ class MexcPumpBot:
                     bot_stats = self.bot_manager.get_stats()
                     log_msg += f"\n   Production: {bot_stats['total_bots']} bots, {bot_stats['total_trades']} trades"
 
-                # ✨ THÊM - Real bots stats
-                if self.real_bots:
-                    total_real_trades = sum(b.total_trades for b in self.real_bots)
-                    total_real_pnl = sum(b.total_pnl for b in self.real_bots)
-                    log_msg += f"\n   Real: {len(self.real_bots)} bots, {total_real_trades} trades, ${total_real_pnl:.2f}"
-
                 self.log.i(self.tag, log_msg)
 
         except Exception as e:
@@ -539,48 +425,8 @@ class MexcPumpBot:
                 self.log.i(self.tag, "📊 Generating periodic strategy report...")
                 await self.strategy_manager.report_results()
 
-                # ✨ THÊM - Report real bots stats
-                if self.real_bots:
-                    await self._report_real_bots_stats()
-
             except Exception as e:
                 self.log.e(self.tag, f"Error in periodic report: {e}")
-
-    # ✨ THÊM METHOD - Report real bots stats
-    async def _report_real_bots_stats(self):
-        """Report stats của real bots"""
-        try:
-            if not self.real_bots:
-                return
-
-            total_trades = sum(b.total_trades for b in self.real_bots)
-            total_pnl = sum(b.total_pnl for b in self.real_bots)
-            total_winning = sum(b.winning_trades for b in self.real_bots)
-            win_rate = (total_winning / total_trades * 100) if total_trades > 0 else 0
-
-            message = (
-                f"🔴 REAL BOTS HOURLY REPORT\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Bots: {len(self.real_bots)}\n"
-                f"Total Trades: {total_trades}\n"
-                f"Win Rate: {win_rate:.1f}%\n"
-                f"Total PnL: ${total_pnl:.2f}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-            )
-
-            for bot in self.real_bots:
-                stats = bot.get_stats()
-                message += (
-                    f"• {stats['account_id']}: "
-                    f"{stats['total_trades']}T | "
-                    f"{stats['win_rate']:.1f}% | "
-                    f"${stats['total_pnl']:.2f}\n"
-                )
-
-            self.log.i(self.tag, message)
-
-        except Exception as e:
-            self.log.e(self.tag, f"Error reporting real bots: {e}")
 
     async def status_monitor(self):
         """Monitor và report status bot"""
@@ -612,12 +458,6 @@ class MexcPumpBot:
                     f"📊 Completed Trades: {total_completed_trades}\n"
                     f"💰 Symbols Monitored: {len(self.symbols)}"
                 )
-
-                # ✨ THÊM - Real bots info
-                if self.real_bots:
-                    total_real_pnl = sum(b.total_pnl for b in self.real_bots)
-                    active_real_positions = sum(len(b.active_positions) for b in self.real_bots)
-                    message += f"\n🔴 Real Bots: {len(self.real_bots)} | ${total_real_pnl:.2f}"
 
                 self.log.i(self.tag, message)
                 await self.tele_message.send_message(message, self.chat_id)
@@ -708,96 +548,6 @@ class MexcPumpBot:
 
         return self.config_updater.get_stats()
 
-    # ✨ THÊM - REAL TRADING CONTROL METHODS
-
-    async def add_real_account(self, account_data: Dict):
-        """
-        Thêm real account runtime (không cần restart bot)
-
-        Args:
-            account_data: Dict chứa thông tin account
-                {
-                    'account_id': 'bot_003',
-                    'api_key': 'xxx',
-                    'secret_key': 'xxx',
-                    'chat_id': '@channel',
-                    'position_size_usdt': 15,
-                    'leverage': 10,
-                }
-        """
-        if not REAL_TRADING_AVAILABLE:
-            self.log.e(self.tag, "❌ Real trading modules not available")
-            return None
-
-        try:
-            if not self.config_loader:
-                self.config_loader = ConfigLoader()
-
-            account = self.config_loader.add_account_from_dict(account_data)
-
-            real_bot = RealBotLive(
-                account_config=account,
-                db_manager=self.db_manager,
-                log=self.log,
-            )
-
-            await real_bot.start()
-            self.real_bots.append(real_bot)
-
-            self.log.i(self.tag, f"✅ Added real bot: {account.account_id}")
-
-            await self.tele_message.send_message(
-                f"✅ Real bot added: {account.account_id}\n"
-                f"Exchange: {account.exchange}\n"
-                f"Chat: {account.chat_id}",
-                self.chat_id
-            )
-
-            return account
-
-        except Exception as e:
-            self.log.e(self.tag, f"Error adding real account: {e}")
-            return None
-
-    async def remove_real_account(self, account_id: str) -> bool:
-        """Remove real account by ID"""
-        try:
-            for i, bot in enumerate(self.real_bots):
-                if bot.account_config.account_id == account_id:
-                    await bot.stop()
-                    self.real_bots.pop(i)
-                    self.log.i(self.tag, f"✅ Removed real bot: {account_id}")
-                    return True
-
-            self.log.w(self.tag, f"Real bot not found: {account_id}")
-            return False
-
-        except Exception as e:
-            self.log.e(self.tag, f"Error removing real account: {e}")
-            return False
-
-    def get_real_bot_stats(self) -> List[Dict]:
-        """Get stats của tất cả real bots"""
-        return [bot.get_stats() for bot in self.real_bots]
-
-    async def stop(self):
-        """Stop bot gracefully"""
-        try:
-            self.log.i(self.tag, "🛑 Stopping bot...")
-
-            # Stop real bots
-            for real_bot in self.real_bots:
-                await real_bot.stop()
-
-            # Stop config updater
-            if self.config_updater:
-                self.config_updater.stop()
-
-            self.log.i(self.tag, "✅ Bot stopped")
-
-        except Exception as e:
-            self.log.e(self.tag, f"Error stopping bot: {e}")
-
 
 # ===== ENTRY POINT =====
 
@@ -805,18 +555,10 @@ async def main():
     """Main entry point"""
 
     # Create bot (không cần API key cho backtest mode)
-    # Có thể truyền path đến config file cho real trading
-    bot = MexcPumpBot(
-        real_accounts_path="config/real_accounts.json"  # Optional
-    )
+    bot = MexcPumpBot()
 
-    try:
-        # Start bot
-        await bot.start()
-
-    except KeyboardInterrupt:
-        print("\n👋 Bot stopped by user")
-        await bot.stop()
+    # Start bot
+    await bot.start()
 
 
 if __name__ == "__main__":
@@ -831,7 +573,6 @@ if __name__ == "__main__":
         print("  2. Detect pump signals in real-time")
         print("  3. Backtest strategies simultaneously")
         print("  4. Report best strategies every hour")
-        print("  5. Trade with real bots (if configured)")
         print("=" * 50)
         print()
 
