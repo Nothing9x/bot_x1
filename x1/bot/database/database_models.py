@@ -82,6 +82,7 @@ class BotConfig(Base):
     account_name = Column(String(100), nullable=True)  # Tên account (link với file config)
     api_key = Column(String(200), nullable=True)  # API Key (encrypted)
     api_secret = Column(String(200), nullable=True)  # API Secret (encrypted)
+    chat_id = Column(String(100), nullable=True)  # Chat ID riêng cho real bot notifications
 
     # ✨ NEW: Link tới source bot (simulated bot mà real bot copy config từ đó)
     source_bot_id = Column(Integer, ForeignKey('bot_configs.id'), nullable=True)
@@ -121,6 +122,7 @@ class BotConfig(Base):
             'is_active': self.is_active,
             'is_real_bot': self.is_real_bot,
             'account_name': self.account_name,
+            'chat_id': self.chat_id,
             'source_bot_id': self.source_bot_id,
             'total_trades': self.total_trades,
             'winning_trades': self.winning_trades,

@@ -144,14 +144,16 @@ class BotManager:
             self.log.i(self.tag, f"🔄 Updated real bot: {bot_name}")
 
             # Load vào memory nếu chưa có
-            if not any(b.bot_config.id == existing_bot.id for b in self.bots):
+            if not any(b.bot_config_id == existing_bot.id for b in self.bots):
+                # ✨ Real bot dùng chat_id riêng từ config, fallback về chat_id chung
+                real_chat_id = existing_bot.chat_id or self.chat_id
                 bot = TradingBot(
                     bot_config=existing_bot,
                     db_manager=self.db_manager,
                     log=self.log,
                     tele_message=self.tele_message,
                     exchange=self.exchange,
-                    chat_id=self.chat_id
+                    chat_id=real_chat_id
                 )
                 self.bots.append(bot)
         else:
@@ -164,13 +166,15 @@ class BotManager:
                 session.add(bot_config)
                 session.flush()
 
+                # ✨ Real bot dùng chat_id riêng từ config, fallback về chat_id chung
+                real_chat_id = bot_config.chat_id or self.chat_id
                 bot = TradingBot(
                     bot_config=bot_config,
                     db_manager=self.db_manager,
                     log=self.log,
                     tele_message=self.tele_message,
                     exchange=self.exchange,
-                    chat_id=self.chat_id
+                    chat_id=real_chat_id
                 )
                 self.bots.append(bot)
 
@@ -256,6 +260,7 @@ class BotManager:
             account_name=account_config.get('account_name'),
             api_key=account_config.get('api_key'),
             api_secret=account_config.get('api_secret'),
+            chat_id=account_config.get('chat_id'),  # Chat ID riêng cho real bot
             source_bot_id=source_bot_id,
         )
 
@@ -285,6 +290,8 @@ class BotManager:
         real_bot.api_key = account_config.get('api_key', real_bot.api_key)
         real_bot.api_secret = account_config.get('api_secret', real_bot.api_secret)
         real_bot.position_size_usdt = account_config.get('position_size_usdt', real_bot.position_size_usdt)
+        real_bot.chat_id = account_config.get('chat_id', real_bot.chat_id)
+        real_bot.chat_id = account_config.get('chat_id', real_bot.chat_id)
 
     async def _send_real_bot_created_notification(self, bot_config: BotConfig, source_bot: BotConfig):
         """Gửi notification khi tạo real bot mới"""
@@ -313,7 +320,9 @@ class BotManager:
                 f"{source_info}"
             )
 
-            await self.tele_message.send_message(message, self.chat_id)
+            # Gửi đến chat_id riêng của real bot nếu có, không thì dùng default
+            target_chat_id = bot_config.chat_id or self.chat_id
+            await self.tele_message.send_message(message, target_chat_id)
 
         except Exception as e:
             self.log.e(self.tag, f"Error sending notification: {e}")
@@ -688,15 +697,16 @@ class BotManager:
     def _sync_bot_instance(self, bot_config: BotConfig):
         """Sync config từ database vào TradingBot instance trong memory"""
         for bot in self.bots:
-            if bot.bot_config.id == bot_config.id:
-                bot.bot_config.take_profit = bot_config.take_profit
-                bot.bot_config.stop_loss = bot_config.stop_loss
-                bot.bot_config.volume_multiplier = bot_config.volume_multiplier
-                bot.bot_config.min_confidence = bot_config.min_confidence
-                bot.bot_config.price_increase_threshold = bot_config.price_increase_threshold
-                bot.bot_config.rsi_threshold = bot_config.rsi_threshold
-                bot.bot_config.trailing_stop = bot_config.trailing_stop
-                bot.bot_config.reduce = getattr(bot_config, 'reduce', 5) or 5
+            if bot.bot_config_id == bot_config.id:
+                # Sync cached values trong TradingBot
+                bot.take_profit = bot_config.take_profit
+                bot.stop_loss = bot_config.stop_loss
+                bot.volume_multiplier = bot_config.volume_multiplier
+                bot.min_confidence = bot_config.min_confidence
+                bot.price_increase_threshold = bot_config.price_increase_threshold
+                bot.rsi_threshold = bot_config.rsi_threshold
+                bot.trailing_stop = getattr(bot_config, 'trailing_stop', False)
+                bot.reduce = getattr(bot_config, 'reduce', 5) or 5
                 break
 
     async def _send_real_bot_updated_notification(self, real_bot: BotConfig, source_bot: BotConfig):
@@ -717,7 +727,9 @@ class BotManager:
                 f"└ Trail: {'✅' if real_bot.trailing_stop else '❌'}"
             )
 
-            await self.tele_message.send_message(message, self.chat_id)
+            # Gửi đến chat_id riêng của real bot nếu có
+            target_chat_id = real_bot.chat_id or self.chat_id
+            await self.tele_message.send_message(message, target_chat_id)
 
         except Exception as e:
             self.log.e(self.tag, f"Error sending notification: {e}")
