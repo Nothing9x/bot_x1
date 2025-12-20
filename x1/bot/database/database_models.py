@@ -1,10 +1,14 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Database models cho Trading Bot System
+Database models cho MEXC Trading Bot System
 Using SQLAlchemy ORM
 
-UPDATED: Thêm field 'reduce' thay thế 'trailing_stop'
+UPDATE: Thêm các trường cho Real Bot:
+- api_key, api_secret (encrypted)
+- account_name (để link với file config)
+- is_real_bot (flag để phân biệt real bot được load từ config file)
+- source_bot_id (link tới simulated bot nguồn)
+- reduce (strategy reduce parameter)
 """
 
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, Text, ForeignKey, Enum
@@ -60,16 +64,27 @@ class BotConfig(Base):
     min_confidence = Column(Float, nullable=False)
 
     # Advanced settings
-    trailing_stop = Column(Boolean, default=False)  # Kept for backwards compatibility
-    reduce = Column(Float, default=0.0)  # ✨ NEW: Reduce TP % per minute (0 = disabled)
+    trailing_stop = Column(Boolean, default=False)
     min_trend_strength = Column(Float, default=0.0)
     require_breakout = Column(Boolean, default=False)
     min_volume_consistency = Column(Float, default=0.0)
     timeframe = Column(String(10), default='1m')
 
+    # ✨ NEW: Reduce parameter (giảm TP theo thời gian)
+    reduce = Column(Float, default=5.0)  # %/minute, default 5% nếu không có
+
     # Mode
     trade_mode = Column(Enum(TradeModeEnum), nullable=False, default=TradeModeEnum.SIMULATED)
     is_active = Column(Boolean, default=True)
+
+    # ✨ NEW: Real Bot specific fields
+    is_real_bot = Column(Boolean, default=False)  # True nếu là bot load từ config file
+    account_name = Column(String(100), nullable=True)  # Tên account (link với file config)
+    api_key = Column(String(200), nullable=True)  # API Key (encrypted)
+    api_secret = Column(String(200), nullable=True)  # API Secret (encrypted)
+
+    # ✨ NEW: Link tới source bot (simulated bot mà real bot copy config từ đó)
+    source_bot_id = Column(Integer, ForeignKey('bot_configs.id'), nullable=True)
 
     # Metadata
     created_at = Column(DateTime, default=datetime.now)
@@ -95,15 +110,18 @@ class BotConfig(Base):
             'direction': self.direction.value,
             'take_profit': self.take_profit,
             'stop_loss': self.stop_loss,
+            'reduce': self.reduce,
             'position_size_usdt': self.position_size_usdt,
             'price_increase_threshold': self.price_increase_threshold,
             'volume_multiplier': self.volume_multiplier,
             'rsi_threshold': self.rsi_threshold,
             'min_confidence': self.min_confidence,
             'trailing_stop': self.trailing_stop,
-            'reduce': self.reduce,  # ✨ NEW
             'trade_mode': self.trade_mode.value,
             'is_active': self.is_active,
+            'is_real_bot': self.is_real_bot,
+            'account_name': self.account_name,
+            'source_bot_id': self.source_bot_id,
             'total_trades': self.total_trades,
             'winning_trades': self.winning_trades,
             'total_pnl': self.total_pnl,
@@ -138,7 +156,6 @@ class Trade(Base):
     # Targets
     take_profit = Column(Float, nullable=False)
     stop_loss = Column(Float, nullable=False)
-    reduce = Column(Float, default=0.0)  # ✨ NEW: Reduce rate at entry
 
     # Tracking
     highest_price = Column(Float, nullable=True)
@@ -176,7 +193,6 @@ class Trade(Base):
             'quantity': self.quantity,
             'take_profit': self.take_profit,
             'stop_loss': self.stop_loss,
-            'reduce': self.reduce,  # ✨ NEW
             'pnl_usdt': self.pnl_usdt,
             'pnl_percent': self.pnl_percent,
             'exit_reason': self.exit_reason,
@@ -244,7 +260,7 @@ class BacktestResult(Base):
     strategy_id = Column(Integer, nullable=False)
     strategy_name = Column(String(200), nullable=False)
 
-    # Config (JSON) - chứa tất cả config bao gồm reduce
+    # Config (JSON)
     config_json = Column(Text, nullable=False)
 
     # Results
@@ -303,35 +319,3 @@ class DatabaseManager:
     def drop_tables(self):
         """Xóa tất cả tables (cẩn thận!)"""
         Base.metadata.drop_all(self.engine)
-
-    def migrate_add_reduce_column(self):
-        """
-        Migration: Thêm column 'reduce' vào existing database
-        Chạy 1 lần nếu database đã tồn tại
-        """
-        from sqlalchemy import text
-
-        try:
-            with self.engine.connect() as conn:
-                # Add reduce to bot_configs
-                conn.execute(text("ALTER TABLE bot_configs ADD COLUMN reduce FLOAT DEFAULT 0.0"))
-                # Add reduce to trades
-                conn.execute(text("ALTER TABLE trades ADD COLUMN reduce FLOAT DEFAULT 0.0"))
-                conn.commit()
-                print("✅ Migration successful: Added 'reduce' column")
-        except Exception as e:
-            if "duplicate column" in str(e).lower() or "already exists" in str(e).lower():
-                print("ℹ️ Column 'reduce' already exists")
-            else:
-                print(f"⚠️ Migration error: {e}")
-
-
-# Example usage
-if __name__ == "__main__":
-    db = DatabaseManager()
-    db.create_tables()
-
-    # Run migration nếu cần
-    db.migrate_add_reduce_column()
-
-    print("✅ Database ready with 'reduce' field")

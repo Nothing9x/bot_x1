@@ -6,16 +6,17 @@ BotManager - Quản lý nhiều trading bots
 - Monitor performance
 - Detailed report với config
 
-FIX:
-1. Tạo 5 LONG + 5 SHORT (thay vì top 5 chung)
-2. Thêm reduce vào notification
-3. Đọc reduce từ strategy config
+UPDATE:
+1. Load real bots từ config files (config/account_*.json)
+2. Real bots tự động copy trading parameters từ best simulated bot
+3. Update real bots khi update_bot_configs()
 """
 
 import asyncio
 import traceback
 from typing import List, Dict
 import json
+import os
 from datetime import datetime
 
 from x1.bot.database.database_models import Trade, TradeStatusEnum, DatabaseManager, BotConfig, DirectionEnum, \
@@ -33,7 +34,7 @@ class BotManager:
     """
 
     def __init__(self, db_manager: DatabaseManager, strategy_manager: StrategyManager,
-                 log, tele_message, exchange=None, chat_id=""):
+                 log, tele_message, exchange=None, chat_id="", config_folder="config"):
         self.tag = "BotManager"
         self.db_manager = db_manager
         self.strategy_manager = strategy_manager
@@ -41,6 +42,7 @@ class BotManager:
         self.tele_message = tele_message
         self.exchange = exchange
         self.chat_id = chat_id
+        self.config_folder = config_folder
 
         # Active bots
         self.bots: List[TradingBot] = []
@@ -63,10 +65,12 @@ class BotManager:
             # Load existing bots from database
             await self.load_bots_from_db()
 
+            # ✨ NEW: Load real bots từ config files
+            await self.load_real_bots_from_config()
+
             # Auto create bots nếu chưa có
             if len(self.bots) == 0 and self.config['auto_create_from_backtest']:
                 self.log.i(self.tag, "📊 No bots found, will auto-create from backtest after warm-up...")
-                # Schedule auto-create sau 1 tiếng để có backtest data
                 asyncio.create_task(self._delayed_auto_create_bots())
 
             # Start monitoring tasks
@@ -79,24 +83,255 @@ class BotManager:
         except Exception as e:
             self.log.e(self.tag, f"Error initializing: {e}\n{traceback.format_exc()}")
 
-    async def _delayed_auto_create_bots(self):
-        """Tự động tạo bots sau khi có đủ backtest data - ĐỢI 1 TIẾNG"""
+    async def load_real_bots_from_config(self):
+        """
+        ✨ NEW: Load real bots từ config files trong folder config/
+        File format: account_*.json
+        """
         try:
-            # ✨ FIX: Đợi 1 tiếng (3600s) thay vì 30 phút
+            if not os.path.exists(self.config_folder):
+                self.log.w(self.tag, f"⚠️ Config folder not found: {self.config_folder}")
+                return
+
+            config_files = [f for f in os.listdir(self.config_folder)
+                            if f.startswith('account_') and f.endswith('.json')]
+
+            if not config_files:
+                self.log.i(self.tag, "📁 No account config files found")
+                return
+
+            self.log.i(self.tag, f"📁 Found {len(config_files)} account config files")
+
+            session = self.db_manager.get_session()
+
+            for config_file in config_files:
+                try:
+                    await self._load_single_real_bot(session, config_file)
+                except Exception as e:
+                    self.log.e(self.tag, f"Error loading {config_file}: {e}")
+
+            session.commit()
+            session.close()
+
+        except Exception as e:
+            self.log.e(self.tag, f"Error loading real bots from config: {e}\n{traceback.format_exc()}")
+
+    async def _load_single_real_bot(self, session, config_file: str):
+        """Load một real bot từ config file"""
+        config_path = os.path.join(self.config_folder, config_file)
+
+        with open(config_path, 'r') as f:
+            account_config = json.load(f)
+
+        account_name = account_config.get('account_name', config_file.replace('.json', ''))
+        direction = account_config.get('direction', 'LONG')
+
+        # Tạo bot name
+        bot_name = f"RealBot-{account_name}-{direction}"
+
+        # Check if bot already exists in database
+        existing_bot = session.query(BotConfig).filter_by(
+            name=bot_name,
+            is_real_bot=True
+        ).first()
+
+        # Get best simulated bot để copy config
+        best_sim_bot = self._get_best_simulated_bot(session, direction)
+
+        if existing_bot:
+            # Update existing real bot
+            self._update_real_bot_from_sim(existing_bot, best_sim_bot, account_config)
+            self.log.i(self.tag, f"🔄 Updated real bot: {bot_name}")
+
+            # Load vào memory nếu chưa có
+            if not any(b.bot_config.id == existing_bot.id for b in self.bots):
+                bot = TradingBot(
+                    bot_config=existing_bot,
+                    db_manager=self.db_manager,
+                    log=self.log,
+                    tele_message=self.tele_message,
+                    exchange=self.exchange,
+                    chat_id=self.chat_id
+                )
+                self.bots.append(bot)
+        else:
+            # Create new real bot
+            bot_config = self._create_real_bot_config(
+                session, bot_name, direction, account_config, best_sim_bot
+            )
+
+            if bot_config:
+                session.add(bot_config)
+                session.flush()
+
+                bot = TradingBot(
+                    bot_config=bot_config,
+                    db_manager=self.db_manager,
+                    log=self.log,
+                    tele_message=self.tele_message,
+                    exchange=self.exchange,
+                    chat_id=self.chat_id
+                )
+                self.bots.append(bot)
+
+                self.log.i(self.tag, f"✅ Created new real bot: {bot_name}")
+
+                # Send notification
+                await self._send_real_bot_created_notification(bot_config, best_sim_bot)
+
+    def _get_best_simulated_bot(self, session, direction: str) -> BotConfig:
+        """Lấy best simulated bot theo direction"""
+        direction_enum = DirectionEnum.LONG if direction == 'LONG' else DirectionEnum.SHORT
+
+        best_bot = session.query(BotConfig).filter(
+            BotConfig.trade_mode == TradeModeEnum.SIMULATED,
+            BotConfig.direction == direction_enum,
+            BotConfig.is_active == True,
+            BotConfig.total_trades >= self.config['min_trades_for_promotion']
+        ).order_by(BotConfig.total_pnl.desc()).first()
+
+        return best_bot
+
+    def _create_real_bot_config(self, session, bot_name: str, direction: str,
+                                account_config: dict, best_sim_bot: BotConfig) -> BotConfig:
+        """Tạo BotConfig cho real bot"""
+        direction_enum = DirectionEnum.LONG if direction == 'LONG' else DirectionEnum.SHORT
+
+        # Default values nếu không có best_sim_bot
+        default_params = {
+            'take_profit': 3.0,
+            'stop_loss': 2.0,
+            'price_increase_threshold': 1.0,
+            'volume_multiplier': 2.0,
+            'rsi_threshold': 60,
+            'min_confidence': 70,
+            'trailing_stop': False,
+            'min_trend_strength': 0.0,
+            'require_breakout': False,
+            'min_volume_consistency': 0.0,
+            'timeframe': '1m',
+            'reduce': 5.0,  # Default 5%/min
+        }
+
+        # Copy từ best_sim_bot nếu có
+        if best_sim_bot:
+            params = {
+                'take_profit': best_sim_bot.take_profit,
+                'stop_loss': best_sim_bot.stop_loss,
+                'price_increase_threshold': best_sim_bot.price_increase_threshold,
+                'volume_multiplier': best_sim_bot.volume_multiplier,
+                'rsi_threshold': best_sim_bot.rsi_threshold,
+                'min_confidence': best_sim_bot.min_confidence,
+                'trailing_stop': best_sim_bot.trailing_stop,
+                'min_trend_strength': best_sim_bot.min_trend_strength,
+                'require_breakout': best_sim_bot.require_breakout,
+                'min_volume_consistency': best_sim_bot.min_volume_consistency,
+                'timeframe': best_sim_bot.timeframe,
+                'reduce': getattr(best_sim_bot, 'reduce', 5) or 5,
+            }
+            source_bot_id = best_sim_bot.id
+        else:
+            params = default_params
+            source_bot_id = None
+
+        bot_config = BotConfig(
+            name=bot_name,
+            direction=direction_enum,
+            take_profit=params['take_profit'],
+            stop_loss=params['stop_loss'],
+            position_size_usdt=account_config.get('position_size_usdt', 100),
+            price_increase_threshold=params['price_increase_threshold'],
+            volume_multiplier=params['volume_multiplier'],
+            rsi_threshold=params['rsi_threshold'],
+            min_confidence=params['min_confidence'],
+            trailing_stop=params['trailing_stop'],
+            min_trend_strength=params['min_trend_strength'],
+            require_breakout=params['require_breakout'],
+            min_volume_consistency=params['min_volume_consistency'],
+            timeframe=params['timeframe'],
+            reduce=params['reduce'],
+            trade_mode=TradeModeEnum.REAL,
+            is_active=True,
+            is_real_bot=True,
+            account_name=account_config.get('account_name'),
+            api_key=account_config.get('api_key'),
+            api_secret=account_config.get('api_secret'),
+            source_bot_id=source_bot_id,
+        )
+
+        return bot_config
+
+    def _update_real_bot_from_sim(self, real_bot: BotConfig, sim_bot: BotConfig, account_config: dict):
+        """Update real bot với config từ best simulated bot"""
+        if not sim_bot:
+            return
+
+        # Update trading parameters (KHÔNG update account-specific fields)
+        real_bot.take_profit = sim_bot.take_profit
+        real_bot.stop_loss = sim_bot.stop_loss
+        real_bot.price_increase_threshold = sim_bot.price_increase_threshold
+        real_bot.volume_multiplier = sim_bot.volume_multiplier
+        real_bot.rsi_threshold = sim_bot.rsi_threshold
+        real_bot.min_confidence = sim_bot.min_confidence
+        real_bot.trailing_stop = sim_bot.trailing_stop
+        real_bot.min_trend_strength = sim_bot.min_trend_strength
+        real_bot.require_breakout = sim_bot.require_breakout
+        real_bot.min_volume_consistency = sim_bot.min_volume_consistency
+        real_bot.timeframe = sim_bot.timeframe
+        real_bot.reduce = getattr(sim_bot, 'reduce', 5) or 5
+        real_bot.source_bot_id = sim_bot.id
+
+        # Update account-specific từ config file (có thể đã thay đổi)
+        real_bot.api_key = account_config.get('api_key', real_bot.api_key)
+        real_bot.api_secret = account_config.get('api_secret', real_bot.api_secret)
+        real_bot.position_size_usdt = account_config.get('position_size_usdt', real_bot.position_size_usdt)
+
+    async def _send_real_bot_created_notification(self, bot_config: BotConfig, source_bot: BotConfig):
+        """Gửi notification khi tạo real bot mới"""
+        try:
+            source_info = ""
+            if source_bot:
+                source_info = (
+                    f"\n📊 <b>Source Bot:</b> {source_bot.name}\n"
+                    f"   Stats: {source_bot.total_trades}T | WR:{source_bot.win_rate:.0f}% | ${source_bot.total_pnl:.2f}"
+                )
+
+            reduce_val = getattr(bot_config, 'reduce', 5) or 5
+
+            message = (
+                f"🔴 <b>REAL BOT CREATED</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🤖 Bot: <b>{bot_config.name}</b>\n"
+                f"👤 Account: {bot_config.account_name}\n"
+                f"📈 Direction: {bot_config.direction.value}\n"
+                f"💰 Position: ${bot_config.position_size_usdt}\n\n"
+                f"⚙️ <b>Config:</b>\n"
+                f"├ TP: {bot_config.take_profit}% | SL: {bot_config.stop_loss}%\n"
+                f"├ Vol: {bot_config.volume_multiplier}x | Conf: {bot_config.min_confidence}%\n"
+                f"├ Reduce: {reduce_val}%/min\n"
+                f"└ Trail: {'✅' if bot_config.trailing_stop else '❌'}"
+                f"{source_info}"
+            )
+
+            await self.tele_message.send_message(message, self.chat_id)
+
+        except Exception as e:
+            self.log.e(self.tag, f"Error sending notification: {e}")
+
+    async def _delayed_auto_create_bots(self):
+        """Tự động tạo bots sau khi có đủ backtest data"""
+        try:
             await asyncio.sleep(3600)
 
-            # Check nếu đã có bots thì skip
             if len(self.bots) > 0:
                 return
 
-            # Check nếu backtest có results
             self.strategy_manager.calculate_rankings()
             if not self.strategy_manager.top_strategies:
                 self.log.w(self.tag, "⚠️ No backtest results yet, will retry in 1 hour...")
                 asyncio.create_task(self._delayed_auto_create_bots())
                 return
 
-            # ✨ FIX: Tạo 5 LONG + 5 SHORT bots (SIMULATED mode)
             self.log.i(self.tag, "🤖 Auto-creating 5 LONG + 5 SHORT bots from backtest results...")
             await self.create_bots_from_backtest(top_n=5, mode=TradeModeEnum.SIMULATED)
 
@@ -129,15 +364,12 @@ class BotManager:
             self.log.e(self.tag, f"Error loading bots: {e}")
 
     async def create_bots_from_backtest(self, top_n: int = 5, mode: TradeModeEnum = TradeModeEnum.SIMULATED):
-        """
-        ✨ FIX: Tạo top_n LONG + top_n SHORT bots từ backtest
-        """
+        """Tạo top_n LONG + top_n SHORT bots từ backtest"""
         try:
             self.log.i(self.tag, f"📊 Creating {top_n} LONG + {top_n} SHORT bots from backtest results...")
 
             self.strategy_manager.calculate_rankings()
 
-            # ✨ FIX: Tách riêng LONG và SHORT strategies
             all_strategies = self.strategy_manager.top_strategies
             long_strategies = [s for s in all_strategies if s.config['direction'] == 'LONG'][:top_n]
             short_strategies = [s for s in all_strategies if s.config['direction'] == 'SHORT'][:top_n]
@@ -150,14 +382,12 @@ class BotManager:
             created_count = 0
             created_bots_info = []
 
-            # ✨ Tạo LONG bots
             for rank, strategy in enumerate(long_strategies, 1):
                 result = await self._create_single_bot(session, strategy, rank, 'LONG', mode)
                 if result:
                     created_bots_info.append(result)
                     created_count += 1
 
-            # ✨ Tạo SHORT bots
             for rank, strategy in enumerate(short_strategies, 1):
                 result = await self._create_single_bot(session, strategy, rank, 'SHORT', mode)
                 if result:
@@ -167,7 +397,6 @@ class BotManager:
             session.commit()
             session.close()
 
-            # Send detailed notification
             if created_count > 0:
                 await self._send_bots_created_notification(created_bots_info, mode)
 
@@ -178,24 +407,20 @@ class BotManager:
 
     async def _create_single_bot(self, session, strategy, rank: int, direction: str,
                                  mode: TradeModeEnum) -> Dict:
-        """Tạo một bot từ strategy - helper method"""
+        """Tạo một bot từ strategy"""
         try:
             config = strategy.config
             stats = strategy.stats
 
-            # Tạo bot name với config details
             bot_name = f"Bot-{direction}-R{rank}_TP{config['take_profit']}_SL{config['stop_loss']}"
 
-            # Check if bot already exists
             existing = session.query(BotConfig).filter_by(name=bot_name).first()
             if existing:
                 self.log.d(self.tag, f"Bot {bot_name} already exists, skipping")
                 return None
 
-            # ✨ FIX: Lấy reduce từ strategy config
             reduce_value = config.get('reduce', 0)
 
-            # Create bot config
             bot_config = BotConfig(
                 name=bot_name,
                 direction=DirectionEnum.LONG if direction == 'LONG' else DirectionEnum.SHORT,
@@ -211,19 +436,16 @@ class BotManager:
                 require_breakout=config.get('require_breakout', False),
                 min_volume_consistency=config.get('min_volume_consistency', 0.0),
                 timeframe=config.get('timeframe', '1m'),
+                reduce=reduce_value,
                 trade_mode=mode,
                 is_active=True,
+                is_real_bot=False,
                 source_strategy_id=strategy.strategy_id
             )
-
-            # ✨ FIX: Set reduce nếu column tồn tại trong database
-            if hasattr(bot_config, 'reduce'):
-                bot_config.reduce = reduce_value
 
             session.add(bot_config)
             session.flush()
 
-            # Save backtest result
             backtest_result = BacktestResult(
                 strategy_id=strategy.strategy_id,
                 strategy_name=strategy.get_name(),
@@ -243,7 +465,6 @@ class BotManager:
             )
             session.add(backtest_result)
 
-            # Create bot instance
             bot = TradingBot(
                 bot_config=bot_config,
                 db_manager=self.db_manager,
@@ -275,14 +496,11 @@ class BotManager:
             return None
 
     async def _send_bots_created_notification(self, bots_info: List[Dict], mode: TradeModeEnum):
-        """
-        ✨ FIX: Gửi notification khi tạo bots mới với chi tiết config + REDUCE
-        """
+        """Gửi notification khi tạo bots mới"""
         try:
             mode_emoji = "🔴" if mode == TradeModeEnum.REAL else "🔵"
             mode_str = mode.value
 
-            # ✨ FIX: Đếm LONG và SHORT riêng
             long_count = sum(1 for b in bots_info if b['direction'] == 'LONG')
             short_count = sum(1 for b in bots_info if b['direction'] == 'SHORT')
 
@@ -298,8 +516,6 @@ class BotManager:
                 stats = bot_info['stats']
                 direction = bot_info['direction']
                 direction_emoji = "📈" if direction == 'LONG' else "📉"
-
-                # ✨ FIX: Lấy reduce value
                 reduce_value = bot_info.get('reduce', config.get('reduce', 0))
 
                 message += (
@@ -308,7 +524,7 @@ class BotManager:
                     f"WR:{stats['win_rate']:.0f}% | ${stats['total_pnl']:.2f}\n"
                     f"   ⚙️ TP{config['take_profit']}% SL{config['stop_loss']}% "
                     f"Vol{config['volume_multiplier']}x Conf{config['min_confidence']}% "
-                    f"R{reduce_value}%/m\n"  # ✨ FIX: Thêm reduce
+                    f"R{reduce_value}%/m\n"
                 )
 
             await self.tele_message.send_message(message, self.chat_id)
@@ -321,7 +537,7 @@ class BotManager:
         try:
             tasks = []
             for bot in self.bots:
-                if bot.is_active:  # Dùng cached value
+                if bot.is_active:
                     tasks.append(bot.on_signal(signal))
 
             if tasks:
@@ -335,7 +551,7 @@ class BotManager:
         try:
             tasks = []
             for bot in self.bots:
-                if bot.is_active:  # Dùng cached value
+                if bot.is_active:
                     tasks.append(bot.on_candle_update(symbol, interval, candle_data))
 
             if tasks:
@@ -362,7 +578,10 @@ class BotManager:
                 self.log.e(self.tag, f"Error in auto update: {e}")
 
     async def update_bot_configs(self):
-        """Update bot configs từ backtest results mới"""
+        """
+        Update bot configs từ backtest results mới
+        ✨ UPDATE: Cũng update real bots từ best simulated bots
+        """
         try:
             session = self.db_manager.get_session()
 
@@ -373,6 +592,7 @@ class BotManager:
 
             update_count = 0
 
+            # Update simulated bots
             for rank, strategy in enumerate(long_strategies, 1):
                 bot_name = f"Bot-LONG-Top{rank}"
                 bot_config = session.query(BotConfig).filter_by(name=bot_name).first()
@@ -383,10 +603,11 @@ class BotManager:
                     bot_config.stop_loss = config['stop_loss']
                     bot_config.volume_multiplier = config['volume_multiplier']
                     bot_config.min_confidence = config['min_confidence']
-                    # ✨ FIX: Update reduce nếu có
-                    if hasattr(bot_config, 'reduce'):
-                        bot_config.reduce = config.get('reduce', 0)
+                    bot_config.reduce = config.get('reduce', 0)
                     update_count += 1
+
+                    # ✨ Sync với TradingBot instance trong memory
+                    self._sync_bot_instance(bot_config)
 
             for rank, strategy in enumerate(short_strategies, 1):
                 bot_name = f"Bot-SHORT-Top{rank}"
@@ -398,19 +619,108 @@ class BotManager:
                     bot_config.stop_loss = config['stop_loss']
                     bot_config.volume_multiplier = config['volume_multiplier']
                     bot_config.min_confidence = config['min_confidence']
-                    # ✨ FIX: Update reduce nếu có
-                    if hasattr(bot_config, 'reduce'):
-                        bot_config.reduce = config.get('reduce', 0)
+                    bot_config.reduce = config.get('reduce', 0)
                     update_count += 1
 
-            if update_count > 0:
+                    # ✨ Sync với TradingBot instance trong memory
+                    self._sync_bot_instance(bot_config)
+
+            # ✨ NEW: Update real bots từ best simulated bots
+            real_bots_updated = await self._update_real_bots(session)
+
+            if update_count > 0 or real_bots_updated > 0:
                 session.commit()
-                self.log.i(self.tag, f"✅ Updated {update_count} bot configs from backtest")
+                self.log.i(self.tag,
+                           f"✅ Updated {update_count} sim bots, {real_bots_updated} real bots from backtest")
 
             session.close()
 
         except Exception as e:
             self.log.e(self.tag, f"Error updating configs: {e}")
+
+    async def _update_real_bots(self, session) -> int:
+        """
+        ✨ NEW: Update real bots với config từ best simulated bots
+        """
+        update_count = 0
+
+        # Get all real bots
+        real_bots = session.query(BotConfig).filter_by(
+            is_real_bot=True,
+            is_active=True
+        ).all()
+
+        for real_bot in real_bots:
+            direction = real_bot.direction.value
+            best_sim_bot = self._get_best_simulated_bot(session, direction)
+
+            if best_sim_bot and best_sim_bot.id != real_bot.source_bot_id:
+                # Config changed - update real bot
+                old_source_id = real_bot.source_bot_id
+
+                real_bot.take_profit = best_sim_bot.take_profit
+                real_bot.stop_loss = best_sim_bot.stop_loss
+                real_bot.price_increase_threshold = best_sim_bot.price_increase_threshold
+                real_bot.volume_multiplier = best_sim_bot.volume_multiplier
+                real_bot.rsi_threshold = best_sim_bot.rsi_threshold
+                real_bot.min_confidence = best_sim_bot.min_confidence
+                real_bot.trailing_stop = best_sim_bot.trailing_stop
+                real_bot.min_trend_strength = best_sim_bot.min_trend_strength
+                real_bot.require_breakout = best_sim_bot.require_breakout
+                real_bot.min_volume_consistency = best_sim_bot.min_volume_consistency
+                real_bot.timeframe = best_sim_bot.timeframe
+                real_bot.reduce = getattr(best_sim_bot, 'reduce', 5) or 5
+                real_bot.source_bot_id = best_sim_bot.id
+
+                # ✨ Sync với TradingBot instance trong memory
+                self._sync_bot_instance(real_bot)
+
+                update_count += 1
+
+                # Send notification về config change
+                await self._send_real_bot_updated_notification(real_bot, best_sim_bot)
+
+                self.log.i(self.tag,
+                           f"🔄 Updated real bot {real_bot.name} from {old_source_id} -> {best_sim_bot.id}")
+
+        return update_count
+
+    def _sync_bot_instance(self, bot_config: BotConfig):
+        """Sync config từ database vào TradingBot instance trong memory"""
+        for bot in self.bots:
+            if bot.bot_config.id == bot_config.id:
+                bot.bot_config.take_profit = bot_config.take_profit
+                bot.bot_config.stop_loss = bot_config.stop_loss
+                bot.bot_config.volume_multiplier = bot_config.volume_multiplier
+                bot.bot_config.min_confidence = bot_config.min_confidence
+                bot.bot_config.price_increase_threshold = bot_config.price_increase_threshold
+                bot.bot_config.rsi_threshold = bot_config.rsi_threshold
+                bot.bot_config.trailing_stop = bot_config.trailing_stop
+                bot.bot_config.reduce = getattr(bot_config, 'reduce', 5) or 5
+                break
+
+    async def _send_real_bot_updated_notification(self, real_bot: BotConfig, source_bot: BotConfig):
+        """Gửi notification khi real bot được update config"""
+        try:
+            reduce_val = getattr(real_bot, 'reduce', 5) or 5
+
+            message = (
+                f"🔄 <b>REAL BOT CONFIG UPDATED</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🤖 Bot: <b>{real_bot.name}</b>\n"
+                f"📊 New Source: {source_bot.name}\n"
+                f"   Stats: {source_bot.total_trades}T | WR:{source_bot.win_rate:.0f}% | ${source_bot.total_pnl:.2f}\n\n"
+                f"⚙️ <b>New Config:</b>\n"
+                f"├ TP: {real_bot.take_profit}% | SL: {real_bot.stop_loss}%\n"
+                f"├ Vol: {real_bot.volume_multiplier}x | Conf: {real_bot.min_confidence}%\n"
+                f"├ Reduce: {reduce_val}%/min\n"
+                f"└ Trail: {'✅' if real_bot.trailing_stop else '❌'}"
+            )
+
+            await self.tele_message.send_message(message, self.chat_id)
+
+        except Exception as e:
+            self.log.e(self.tag, f"Error sending notification: {e}")
 
     async def check_promotions(self):
         """Check xem bot nào đủ điều kiện promote từ SIMULATED -> REAL"""
@@ -458,8 +768,7 @@ class BotManager:
 
             self.log.i(self.tag, f"🎉 PROMOTED {bot_config.name} to REAL mode!")
 
-            # ✨ FIX: Thêm reduce vào notification
-            reduce_val = getattr(bot_config, 'reduce', 0) or 0
+            reduce_val = getattr(bot_config, 'reduce', 5) or 5
 
             message = (
                 f"🎉 <b>BOT PROMOTED TO REAL</b>\n"
@@ -493,7 +802,6 @@ class BotManager:
                     session.close()
                     continue
 
-                # Build detailed report
                 message = (
                     f"📊 <b>BOTS PERFORMANCE REPORT</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -507,27 +815,26 @@ class BotManager:
                     message += f"🔴 <b>REAL BOTS ({len(real_bots)}):</b>\n"
                     for bot in real_bots:
                         pnl_emoji = "✅" if bot.total_pnl > 0 else "❌"
-                        reduce_val = getattr(bot, 'reduce', 0) or 0
+                        reduce_val = getattr(bot, 'reduce', 5) or 5
+                        real_tag = " [CFG]" if bot.is_real_bot else ""
                         message += (
-                            f"  {pnl_emoji} {bot.name}\n"
+                            f"  {pnl_emoji} {bot.name}{real_tag}\n"
                             f"     {bot.total_trades}T | WR:{bot.win_rate:.0f}% | ${bot.total_pnl:.2f}\n"
                             f"     TP{bot.take_profit}% SL{bot.stop_loss}% R{reduce_val}%/m\n"
                         )
                     message += "\n"
 
                 if sim_bots:
-                    # Sort by PnL
                     sim_bots_sorted = sorted(sim_bots, key=lambda b: b.total_pnl, reverse=True)
                     message += f"🔵 <b>SIM BOTS ({len(sim_bots)}):</b>\n"
-                    for bot in sim_bots_sorted[:5]:  # Top 5
+                    for bot in sim_bots_sorted[:5]:
                         pnl_emoji = "✅" if bot.total_pnl > 0 else "❌"
-                        reduce_val = getattr(bot, 'reduce', 0) or 0
+                        reduce_val = getattr(bot, 'reduce', 5) or 5
                         message += (
                             f"  {pnl_emoji} {bot.name}\n"
                             f"     {bot.total_trades}T | WR:{bot.win_rate:.0f}% | ${bot.total_pnl:.2f} | R{reduce_val}%/m\n"
                         )
 
-                # Summary
                 total_pnl = sum(b.total_pnl for b in bot_configs)
                 total_trades = sum(b.total_trades for b in bot_configs)
                 message += (
@@ -556,6 +863,7 @@ class BotManager:
 
         real_bots = [b for b in bot_configs if b.trade_mode == TradeModeEnum.REAL]
         sim_bots = [b for b in bot_configs if b.trade_mode == TradeModeEnum.SIMULATED]
+        config_bots = [b for b in bot_configs if b.is_real_bot]
 
         session.close()
 
@@ -563,6 +871,7 @@ class BotManager:
             'total_bots': len(bot_configs),
             'real_bots': len(real_bots),
             'simulated_bots': len(sim_bots),
+            'config_bots': len(config_bots),
             'total_trades': total_trades,
             'total_pnl': total_pnl,
         }
