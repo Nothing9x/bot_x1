@@ -355,13 +355,16 @@ class BotManager:
             bot_configs = session.query(BotConfig).filter_by(is_active=True).all()
 
             for bot_config in bot_configs:
+                # Real bot dùng chat_id riêng nếu có
+                bot_chat_id = getattr(bot_config, 'chat_id', None) or self.chat_id
+
                 bot = TradingBot(
                     bot_config=bot_config,
                     db_manager=self.db_manager,
                     log=self.log,
                     tele_message=self.tele_message,
                     exchange=self.exchange,
-                    chat_id=self.chat_id
+                    chat_id=bot_chat_id
                 )
                 self.bots.append(bot)
 
@@ -649,7 +652,9 @@ class BotManager:
 
     async def _update_real_bots(self, session) -> int:
         """
-        ✨ NEW: Update real bots với config từ best simulated bots
+        ✨ Update real bots với config từ best simulated bots
+        - Update khi có sim bot mới tốt hơn
+        - Hoặc khi config của sim bot hiện tại thay đổi
         """
         update_count = 0
 
@@ -663,10 +668,24 @@ class BotManager:
             direction = real_bot.direction.value
             best_sim_bot = self._get_best_simulated_bot(session, direction)
 
-            if best_sim_bot and best_sim_bot.id != real_bot.source_bot_id:
-                # Config changed - update real bot
-                old_source_id = real_bot.source_bot_id
+            if not best_sim_bot:
+                continue
 
+            # Check xem config có thay đổi không
+            config_changed = (
+                    real_bot.take_profit != best_sim_bot.take_profit or
+                    real_bot.stop_loss != best_sim_bot.stop_loss or
+                    real_bot.price_increase_threshold != best_sim_bot.price_increase_threshold or
+                    real_bot.volume_multiplier != best_sim_bot.volume_multiplier or
+                    real_bot.rsi_threshold != best_sim_bot.rsi_threshold or
+                    real_bot.min_confidence != best_sim_bot.min_confidence or
+                    (getattr(real_bot, 'reduce', 5) or 5) != (getattr(best_sim_bot, 'reduce', 5) or 5)
+            )
+
+            source_changed = best_sim_bot.id != real_bot.source_bot_id
+
+            if config_changed or source_changed:
+                # Update real bot config
                 real_bot.take_profit = best_sim_bot.take_profit
                 real_bot.stop_loss = best_sim_bot.stop_loss
                 real_bot.price_increase_threshold = best_sim_bot.price_increase_threshold
@@ -681,16 +700,17 @@ class BotManager:
                 real_bot.reduce = getattr(best_sim_bot, 'reduce', 5) or 5
                 real_bot.source_bot_id = best_sim_bot.id
 
-                # ✨ Sync với TradingBot instance trong memory
+                # Sync với TradingBot instance trong memory
                 self._sync_bot_instance(real_bot)
 
                 update_count += 1
 
-                # Send notification về config change
+                # Send notification
                 await self._send_real_bot_updated_notification(real_bot, best_sim_bot)
 
                 self.log.i(self.tag,
-                           f"🔄 Updated real bot {real_bot.name} from {old_source_id} -> {best_sim_bot.id}")
+                           f"🔄 Updated real bot {real_bot.name}: "
+                           f"TP={real_bot.take_profit}% SL={real_bot.stop_loss}% R={real_bot.reduce}%")
 
         return update_count
 
