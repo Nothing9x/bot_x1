@@ -117,7 +117,7 @@ class BotManager:
             self.log.e(self.tag, f"Error loading real bots from config: {e}\n{traceback.format_exc()}")
 
     async def _load_single_real_bot(self, session, config_file: str):
-        """Load một real bot từ config file"""
+        """Load một real bot từ config file với GateTradeClient"""
         config_path = os.path.join(self.config_folder, config_file)
 
         with open(config_path, 'r') as f:
@@ -145,17 +145,27 @@ class BotManager:
 
             # Load vào memory nếu chưa có
             if not any(b.bot_config_id == existing_bot.id for b in self.bots):
-                # ✨ Real bot dùng chat_id riêng từ config, fallback về chat_id chung
                 real_chat_id = existing_bot.chat_id or self.chat_id
+
+                # ✨ NEW: Tạo trade client và position socket cho real bot
+                trade_client, position_socket = await self._create_trade_clients(
+                    existing_bot, account_config
+                )
+
                 bot = TradingBot(
                     bot_config=existing_bot,
                     db_manager=self.db_manager,
                     log=self.log,
                     tele_message=self.tele_message,
                     exchange=self.exchange,
-                    chat_id=real_chat_id
+                    chat_id=real_chat_id,
+                    trade_client=trade_client,
+                    position_socket=position_socket
                 )
                 self.bots.append(bot)
+
+                # Start trade client
+                await bot.start()
         else:
             # Create new real bot
             bot_config = self._create_real_bot_config(
@@ -166,22 +176,73 @@ class BotManager:
                 session.add(bot_config)
                 session.flush()
 
-                # ✨ Real bot dùng chat_id riêng từ config, fallback về chat_id chung
                 real_chat_id = bot_config.chat_id or self.chat_id
+
+                # ✨ NEW: Tạo trade client và position socket cho real bot
+                trade_client, position_socket = await self._create_trade_clients(
+                    bot_config, account_config
+                )
+
                 bot = TradingBot(
                     bot_config=bot_config,
                     db_manager=self.db_manager,
                     log=self.log,
                     tele_message=self.tele_message,
                     exchange=self.exchange,
-                    chat_id=real_chat_id
+                    chat_id=real_chat_id,
+                    trade_client=trade_client,
+                    position_socket=position_socket
                 )
                 self.bots.append(bot)
+
+                # Start trade client
+                await bot.start()
 
                 self.log.i(self.tag, f"✅ Created new real bot: {bot_name}")
 
                 # Send notification
                 await self._send_real_bot_created_notification(bot_config, best_sim_bot)
+
+    async def _create_trade_clients(self, bot_config: BotConfig, account_config: dict):
+        """
+        Tạo GateTradeClient và GatePositionSocket cho real bot
+        BotConfig đã có đủ thông tin từ database
+        """
+        try:
+            from x1.bot.exchange.trade.gate_trade_client import GateTradeClient
+            from x1.bot.exchange.position.gate_position_socket import GatePositionSocket
+
+            # Tạo trade client - dùng BotConfig trực tiếp
+            trade_client = GateTradeClient(
+                bot=bot_config,
+                telegramMessage=self.tele_message,
+                log=self.log,
+                trade_callback=lambda connected: self.log.i(self.tag, f"Trade client connected: {connected}")
+            )
+
+            # Tạo position socket với callback
+            async def position_callback_wrapper(symbol, order_response, position_response):
+                for bot in self.bots:
+                    if bot.bot_config_id == bot_config.id:
+                        await bot.on_position_update(symbol, order_response, position_response)
+                        break
+
+            position_socket = GatePositionSocket(
+                bot=bot_config,
+                log=self.log,
+                position_callback=position_callback_wrapper,
+                trade_callback=lambda connected: self.log.i(self.tag, f"Position socket connected: {connected}")
+            )
+
+            self.log.i(self.tag, f"✅ Created trade clients for {bot_config.name}")
+            return trade_client, position_socket
+
+        except ImportError as e:
+            self.log.w(self.tag, f"⚠️ Cannot create trade clients (missing modules): {e}")
+            return None, None
+        except Exception as e:
+            self.log.e(self.tag, f"Error creating trade clients: {e}\n{traceback.format_exc()}")
+            return None, None
 
     def _get_best_simulated_bot(self, session, direction: str) -> BotConfig:
         """Lấy best simulated bot theo direction"""
@@ -358,22 +419,45 @@ class BotManager:
                 # Real bot dùng chat_id riêng nếu có
                 bot_chat_id = getattr(bot_config, 'chat_id', None) or self.chat_id
 
+                # ✨ Tạo trade client cho real bot (chỉ khi có api_key)
+                trade_client = None
+                position_socket = None
+
+                is_real = getattr(bot_config, 'is_real_bot', False)
+                has_api_key = bool(getattr(bot_config, 'api_key', None))
+                is_real_mode = bot_config.trade_mode == TradeModeEnum.REAL
+
+                if is_real and has_api_key and is_real_mode:
+                    trade_client, position_socket = await self._create_trade_clients(bot_config, {})
+                    if trade_client:
+                        self.log.i(self.tag, f"✅ Created trade client for real bot: {bot_config.name}")
+                    else:
+                        self.log.w(self.tag, f"⚠️ Failed to create trade client for: {bot_config.name}")
+                elif is_real_mode and not has_api_key:
+                    self.log.w(self.tag, f"⚠️ Real bot {bot_config.name} has no API key - running in SIM mode")
+
                 bot = TradingBot(
                     bot_config=bot_config,
                     db_manager=self.db_manager,
                     log=self.log,
                     tele_message=self.tele_message,
                     exchange=self.exchange,
-                    chat_id=bot_chat_id
+                    chat_id=bot_chat_id,
+                    trade_client=trade_client,
+                    position_socket=position_socket
                 )
                 self.bots.append(bot)
+
+                # Start real bot
+                if trade_client:
+                    await bot.start()
 
             session.close()
 
             self.log.i(self.tag, f"Loaded {len(self.bots)} bots from database")
 
         except Exception as e:
-            self.log.e(self.tag, f"Error loading bots: {e}")
+            self.log.e(self.tag, f"Error loading bots: {e}\n{traceback.format_exc()}")
 
     async def create_bots_from_backtest(self, top_n: int = 5, mode: TradeModeEnum = TradeModeEnum.SIMULATED):
         """Tạo top_n LONG + top_n SHORT bots từ backtest"""

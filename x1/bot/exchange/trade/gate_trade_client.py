@@ -1,3 +1,8 @@
+# -*- coding: utf-8 -*-
+"""
+GateTradeClient - Gate.io Futures Trading Client
+Sử dụng lowercase attributes từ BotConfig database
+"""
 from __future__ import annotations
 
 import asyncio
@@ -46,15 +51,20 @@ class GateTradeClient(ITradeClient):
         self._trade_task: Optional[asyncio.Task] = None
         self._cancel_cache: deque[int] = deque(maxlen=100)
 
+        # ✨ CHANGED: Dùng lowercase attributes
+        api_key = getattr(bot, 'api_key', '') or ''
+        api_secret = getattr(bot, 'api_secret', '') or ''
+        proxy = getattr(bot, 'proxy', '') or ''
+
         if self.IS_DEV:
             cfg = gate_api.Configuration(host=self.TEST_NET_HOST,
-                                         key=bot.API_KEY,
-                                         secret=bot.SECRET_KEY)
+                                         key=api_key,
+                                         secret=api_secret)
         else:
-            cfg = gate_api.Configuration(key=self.bot.API_KEY,
-                                         secret=self.bot.SECRET_KEY)
-        if self.bot.PROXY:
-            auth_part, addr_part = self.bot.PROXY.split("@")
+            cfg = gate_api.Configuration(key=api_key,
+                                         secret=api_secret)
+        if proxy:
+            auth_part, addr_part = proxy.split("@")
             user, pwd = auth_part.split(":", 1)
             host, port = addr_part.split(":", 1)
             cfg.proxy = f"http://{host}:{port}"
@@ -66,6 +76,16 @@ class GateTradeClient(ITradeClient):
 
         self._leverage_cache: Dict[str, int] = {}
         self._dual_mode_checked = False
+
+    # ===== Helper để lấy config values =====
+    def _get_chat_id(self):
+        return getattr(self.bot, 'chat_id', '') or ''
+
+    def _get_leverage(self):
+        return getattr(self.bot, 'leverage', 20) or 20
+
+    def _get_auto_place_sl_market(self):
+        return getattr(self.bot, 'auto_place_sl_market', True)
 
     # ──────────────────────────── WORKER CONTROL ──────────────────────
     async def start(self):
@@ -94,7 +114,7 @@ class GateTradeClient(ITradeClient):
             tag: str = "",
     ):
         if leverage is None:
-            leverage = self.bot.LEVERAGE
+            leverage = self._get_leverage()
 
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         await self._queue.put(
@@ -119,7 +139,7 @@ class GateTradeClient(ITradeClient):
                 f"{tag} TIMEOUT symbol={symbol} price={price} qty={quantity} side={side}"
             )
             self.log.e(self.tag, msg)
-            await self.tele.send_message(msg, self.bot.CHAT_ID)
+            await self.tele.send_message(msg, self._get_chat_id())
             return None
 
     # ──────────────────────────── INTERNAL WORKER ────────────────────
@@ -229,7 +249,7 @@ class GateTradeClient(ITradeClient):
                 return await self.place_order(
                     symbol, price, quantity, side, leverage, ps, take_profit, stop_loss, retry_count - 1
                 )
-            await self.tele.send_message(f"Gate place order error: {e}", self.bot.CHAT_ID)
+            await self.tele.send_message(f"Gate place order error: {e}", self._get_chat_id())
             return -1
 
     async def _create_tp_sl(
@@ -276,10 +296,10 @@ class GateTradeClient(ITradeClient):
             body = getattr(e, "body", None)
             await self.tele.send_message(
                 f"⚠️ Failed to place initial SL. Please open the web/app to handle this case:\n{body or e}",
-                self.bot.CHAT_ID
+                self._get_chat_id()
             )
 
-            if self.bot.AUTO_PLACE_SL_MARKET:
+            if self._get_auto_place_sl_market():
                 try:
                     order = gate_api.FuturesOrder(
                         contract=contract,
@@ -295,11 +315,11 @@ class GateTradeClient(ITradeClient):
                     )
                     self.log.e(self.tag, f"✅ Retry place SL succeeded: closed position at exchange. Order ID: {res.id}")
                     await self.tele.send_message(f"✅ Retry place SL succeeded: closed position at exchange.",
-                                                 self.bot.CHAT_ID)
+                                                 self._get_chat_id())
                     return res.id
                 except Exception as ex:
                     self.log.e(self.tag, f"❌ Retry close exchange failed: {ex}")
-                    await self.tele.send_message(f"❌ Retry close exchange failed: {ex}", self.bot.CHAT_ID)
+                    await self.tele.send_message(f"❌ Retry close exchange failed: {ex}", self._get_chat_id())
         return -1
 
     async def cancel_order(self, oid: int):
@@ -318,7 +338,7 @@ class GateTradeClient(ITradeClient):
             if label == "ORDER_NOT_FOUND":
                 return oid
             self.log.e(self.tag, f"Cancel error: {e}")
-            await self.tele.send_message(f"Cancel_order {oid}, error: {e}", self.bot.CHAT_ID)
+            await self.tele.send_message(f"Cancel_order {oid}, error: {e}", self._get_chat_id())
             return -1
 
     # ──────────────────────────── UTILS ─────────────────────────────
@@ -380,6 +400,7 @@ class GateTradeClient(ITradeClient):
     async def close_all_positions_and_orders(self):
         fapi = self._fapi
         settle = self.DEFAULT_SETTLE
+        chat_id = self._get_chat_id()
 
         msgs: list[str] = ["🧹 Close all positions and orders summary:"]
         errs: list[str] = []
@@ -462,8 +483,8 @@ class GateTradeClient(ITradeClient):
                 try:
                     order = gate_api.FuturesOrder(
                         contract=symbol,
-                        size=0,  # auto_size + reduce_only => close toàn bộ
-                        price="0",  # exchange
+                        size=0,
+                        price="0",
                         tif="ioc",
                         reduce_only=True,
                         auto_size="close_long" if is_long else "close_short",
@@ -513,4 +534,4 @@ class GateTradeClient(ITradeClient):
             msgs.append("⚠️ Details:")
             msgs.extend(errs)
 
-        await self.tele.send_message("\n".join(msgs), self.bot.CHAT_ID)
+        await self.tele.send_message("\n".join(msgs), chat_id)

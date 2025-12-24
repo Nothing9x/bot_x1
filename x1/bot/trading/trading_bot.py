@@ -4,6 +4,7 @@ TradingBot - Bot trading với Reduce TP Strategy
 - Reduce TP: TP giảm dần về entry rồi về SL theo thời gian
 - Telegram notifications cho cả REAL và SIM
 - Cache config values để tránh SQLAlchemy detached session error
+- ✨ NEW: Support GateTradeClient cho real trading
 """
 
 import asyncio
@@ -11,7 +12,6 @@ import time
 import traceback
 from datetime import datetime
 from typing import Dict, Optional
-import ccxt
 
 from x1.bot.database.database_models import BotConfig, DatabaseManager, Order, OrderStatusEnum, DirectionEnum, \
     TradeStatusEnum, Trade, TradeModeEnum
@@ -25,15 +25,33 @@ class TradingBot:
     - Phút 0: TP = Entry ± TP%
     - Mỗi phút: TP giảm reduce% × (TP_distance + SL_distance)
     - Cuối cùng: TP = SL → force close
+
+    ✨ Real Trading: Dùng GateTradeClient để vào/ra lệnh thật
     """
 
     def __init__(self, bot_config: BotConfig, db_manager: DatabaseManager,
-                 log, tele_message, exchange: ccxt.mexc = None, chat_id=""):
+                 log, tele_message, exchange=None, chat_id="",
+                 trade_client=None, position_socket=None):
+        """
+        Args:
+            bot_config: Config từ database
+            db_manager: Database manager
+            log: Logger
+            tele_message: Telegram message queue
+            exchange: (deprecated) CCXT exchange - không dùng nữa
+            chat_id: Default chat ID
+            trade_client: GateTradeClient instance cho real trading
+            position_socket: GatePositionSocket instance để nhận order updates
+        """
         self.db_manager = db_manager
         self.log = log
         self.tele_message = tele_message
-        self.exchange = exchange
+        self.exchange = exchange  # Deprecated, giữ lại cho backward compatibility
         self.chat_id = chat_id
+
+        # ✨ NEW: Real trading clients
+        self.trade_client = trade_client  # GateTradeClient
+        self.position_socket = position_socket  # GatePositionSocket
 
         # ===== CACHE CONFIG VALUES =====
         self.bot_config_id = bot_config.id
@@ -53,9 +71,12 @@ class TradingBot:
         self.trade_mode = bot_config.trade_mode
         self.is_active = bot_config.is_active
 
+        # ✨ NEW: Real bot specific fields
+        self.is_real_bot = getattr(bot_config, 'is_real_bot', False)
+        self.leverage = getattr(bot_config, 'leverage', 20) or 20
+
         # ===== REDUCE TP CONFIG =====
-        # reduce = % giảm mỗi phút (0 = disabled)
-        self.reduce = getattr(bot_config, 'reduce', 0)
+        self.reduce = getattr(bot_config, 'reduce', 5) or 5
 
         # Stats
         self.total_trades = bot_config.total_trades
@@ -70,9 +91,31 @@ class TradingBot:
         self.active_trades = {}  # {symbol: trade_id}
         self.pending_orders = {}  # {symbol: order_info}
 
+        # ✨ NEW: Track exchange order IDs for real trading
+        self.exchange_orders = {}  # {symbol: {'entry_order_id': x, 'tp_order_id': y, 'sl_order_id': z}}
+
         # ===== REDUCE TP TRACKING =====
-        # Lưu thông tin reduce cho mỗi trade
         self.trade_reduce_info = {}  # {symbol: {initial_tp, last_reduce_minute}}
+
+    async def start(self):
+        """Start bot - khởi động trade client và position socket nếu là real bot"""
+        if self.trade_mode == TradeModeEnum.REAL and self.trade_client:
+            await self.trade_client.start()
+            self.log.i(self.tag, f"✅ Trade client started for {self.bot_name}")
+
+        if self.trade_mode == TradeModeEnum.REAL and self.position_socket:
+            await self.position_socket.start_position_socket()
+            self.log.i(self.tag, f"✅ Position socket started for {self.bot_name}")
+
+    async def stop(self):
+        """Stop bot - dừng trade client và position socket"""
+        if self.trade_client:
+            await self.trade_client.stop()
+
+        if self.position_socket:
+            await self.position_socket.stop_position_socket()
+
+        self.log.i(self.tag, f"🛑 Bot {self.bot_name} stopped")
 
     def _get_config_string(self) -> str:
         """Tạo string config ngắn gọn"""
@@ -81,6 +124,28 @@ class TradingBot:
             f"TP{self.take_profit}%_SL{self.stop_loss}%{reduce_str}_"
             f"Vol{self.volume_multiplier}x_Conf{self.min_confidence}%"
         )
+
+    def _convert_to_gate_symbol(self, symbol: str) -> str:
+        """
+        Convert symbol từ MEXC format sang Gate.io format
+        BTCUSDT -> BTC_USDT
+        ETHUSDT -> ETH_USDT
+        """
+        if '_' in symbol:
+            return symbol  # Đã là Gate format
+
+        # Tìm vị trí USDT
+        if symbol.endswith('USDT'):
+            base = symbol[:-4]
+            return f"{base}_USDT"
+        elif symbol.endswith('USD'):
+            base = symbol[:-3]
+            return f"{base}_USD"
+        elif symbol.endswith('BTC'):
+            base = symbol[:-3]
+            return f"{base}_BTC"
+
+        return symbol  # Không đổi nếu không match
 
     def should_enter(self, signal: Dict) -> bool:
         """Kiểm tra điều kiện vào lệnh"""
@@ -189,7 +254,7 @@ class TradingBot:
             }
 
             if self.trade_mode == TradeModeEnum.REAL:
-                await self.place_real_order(trade_id, symbol, entry_price, quantity)
+                await self.place_real_order(trade_id, symbol, entry_price, quantity, take_profit, stop_loss)
             else:
                 await self.place_simulated_order(trade_id, symbol, entry_price, quantity)
 
@@ -256,53 +321,78 @@ class TradingBot:
         except Exception as e:
             self.log.e(self.tag, f"Error sending entry notification: {e}")
 
-    async def place_real_order(self, trade_id: int, symbol: str, price: float, quantity: float):
-        """Place lệnh THẬT lên MEXC"""
+    async def place_real_order(self, trade_id: int, symbol: str, price: float,
+                               quantity: float, take_profit: float, stop_loss: float):
+        """
+        ✨ Place lệnh THẬT qua GateTradeClient
+        """
         try:
-            session = self.db_manager.get_session()
-            side = 'buy' if self.direction == DirectionEnum.LONG else 'sell'
+            if not self.trade_client:
+                self.log.w(self.tag, f"⚠️ No trade client - skipping real order for {symbol}")
+                await self.cancel_trade(trade_id, "No trade client configured")
+                return
 
-            order = Order(
-                trade_id=trade_id,
-                symbol=symbol,
-                side=side.upper(),
-                order_type='MARKET',
-                quantity=quantity,
-                status=OrderStatusEnum.PENDING
+            # Import TradeSide
+            from x1.bot.exchange.trade.trade_side import TradeSide
+
+            # ✨ Convert symbol format: BTCUSDT -> BTC_USDT (Gate.io format)
+            gate_symbol = self._convert_to_gate_symbol(symbol)
+
+            # Determine side
+            if self.direction == DirectionEnum.LONG:
+                side = TradeSide.OPEN_LONG
+            else:
+                side = TradeSide.OPEN_SHORT
+
+            # Calculate quantity in contracts (Gate.io uses contracts, not coins)
+            qty_contracts = int(quantity)  # Hoặc tính toán dựa trên contract size
+
+            self.log.i(self.tag, f"📤 Placing REAL order: {gate_symbol} qty={qty_contracts} side={side}")
+
+            # Place entry order với TP/SL
+            order_id = await self.trade_client.send_order(
+                orderId=-1,  # -1 = new order
+                symbol=gate_symbol,  # ✨ Dùng Gate.io format
+                price=0,  # 0 = market order
+                quantity=qty_contracts,
+                side=side,
+                leverage=self.leverage,
+                take_profit=take_profit,
+                stop_loss=stop_loss,
+                tag=f"Entry-{self.bot_name}"
             )
 
-            session.add(order)
-            session.commit()
+            if order_id and order_id > 0:
+                # Track order
+                self.exchange_orders[symbol] = {
+                    'entry_order_id': order_id,
+                    'trade_id': trade_id,
+                    'gate_symbol': gate_symbol,  # ✨ Lưu gate symbol
+                }
 
-            if self.exchange:
-                try:
-                    result = self.exchange.create_order(
-                        symbol=symbol,
-                        type='exchange',
-                        side=side,
-                        amount=quantity
-                    )
+                # Update database
+                session = self.db_manager.get_session()
+                order = Order(
+                    trade_id=trade_id,
+                    exchange_order_id=str(order_id),
+                    symbol=symbol,
+                    side='BUY' if self.direction == DirectionEnum.LONG else 'SELL',
+                    order_type='MARKET',
+                    quantity=qty_contracts,
+                    status=OrderStatusEnum.FILLED,
+                    filled_at=datetime.now()
+                )
+                session.add(order)
+                session.commit()
+                session.close()
 
-                    order.exchange_order_id = result['id']
-                    order.status = OrderStatusEnum.FILLED
-                    order.filled_quantity = result.get('filled', quantity)
-                    order.avg_fill_price = result.get('average', price)
-                    order.filled_at = datetime.now()
-                    session.commit()
-
-                    self.log.i(self.tag, f"✅ REAL order filled: {result['id']}")
-
-                except Exception as e:
-                    order.status = OrderStatusEnum.REJECTED
-                    order.error_message = str(e)
-                    session.commit()
-                    await self.cancel_trade(trade_id, "Order rejected")
-                    self.log.e(self.tag, f"❌ REAL order failed: {e}")
-
-            session.close()
+                self.log.i(self.tag, f"✅ REAL order placed: {order_id}")
+            else:
+                self.log.e(self.tag, f"❌ REAL order failed: {order_id}")
+                await self.cancel_trade(trade_id, f"Order failed: {order_id}")
 
         except Exception as e:
-            self.log.e(self.tag, f"Error placing real order: {e}")
+            self.log.e(self.tag, f"Error placing real order: {e}\n{traceback.format_exc()}")
 
     async def place_simulated_order(self, trade_id: int, symbol: str, price: float, quantity: float):
         """Place lệnh SIMULATED"""
@@ -317,6 +407,68 @@ class TradingBot:
             self.log.d(self.tag, f"📝 SIM order pending for {symbol} at ${price:.6f}")
         except Exception as e:
             self.log.e(self.tag, f"Error placing simulated order: {e}")
+
+    async def on_position_update(self, symbol: str, order_response, position_response):
+        """
+        ✨ NEW: Callback từ GatePositionSocket khi có order/position update
+        """
+        try:
+            if symbol not in self.active_trades:
+                return
+
+            trade_id = self.active_trades[symbol]
+
+            if order_response:
+                # Order update
+                status = order_response.status
+                self.log.i(self.tag, f"📡 Order update for {symbol}: {status}")
+
+                if status == 'finished':
+                    # Order filled - có thể là TP hoặc SL
+                    text = getattr(order_response, 'text', '')
+                    if 'tp' in text.lower():
+                        await self._handle_real_exit(symbol, trade_id, 'TP')
+                    elif 'sl' in text.lower():
+                        await self._handle_real_exit(symbol, trade_id, 'SL')
+
+            if position_response:
+                # Position update
+                size = getattr(position_response, 'size', 0)
+                if size == 0:
+                    # Position closed
+                    self.log.i(self.tag, f"📡 Position closed for {symbol}")
+
+        except Exception as e:
+            self.log.e(self.tag, f"Error handling position update: {e}")
+
+    async def _handle_real_exit(self, symbol: str, trade_id: int, reason: str):
+        """Handle exit cho real trade"""
+        try:
+            session = self.db_manager.get_session()
+            trade = session.query(Trade).filter_by(id=trade_id).first()
+
+            if not trade or trade.status != TradeStatusEnum.OPEN:
+                session.close()
+                return
+
+            # Get exit price from exchange orders hoặc dùng TP/SL price
+            if reason == 'TP':
+                exit_price = trade.take_profit
+            else:
+                exit_price = trade.stop_loss
+
+            await self.close_trade(trade, exit_price, reason, session)
+
+            # Cleanup
+            if symbol in self.exchange_orders:
+                del self.exchange_orders[symbol]
+            if symbol in self.trade_reduce_info:
+                del self.trade_reduce_info[symbol]
+
+            session.close()
+
+        except Exception as e:
+            self.log.e(self.tag, f"Error handling real exit: {e}")
 
     async def on_candle_update(self, symbol: str, interval: str, candle_data: dict):
         """Nhận candle update để check exits"""
@@ -335,10 +487,96 @@ class TradingBot:
                 await self.check_pending_order(symbol, candle)
 
             if symbol in self.active_trades:
-                await self.check_exit(symbol, candle)
+                # Real trades: chỉ update reduce TP, không check exit (exchange sẽ handle)
+                if self.trade_mode == TradeModeEnum.REAL:
+                    await self.update_real_trade_tp(symbol, candle)
+                else:
+                    await self.check_exit(symbol, candle)
 
         except Exception as e:
             self.log.e(self.tag, f"Error processing candle: {e}")
+
+    async def update_real_trade_tp(self, symbol: str, candle: Dict):
+        """
+        ✨ NEW: Update TP cho real trade (reduce TP strategy)
+        """
+        try:
+            if self.reduce <= 0:
+                return  # Không có reduce
+
+            trade_id = self.active_trades.get(symbol)
+            if not trade_id:
+                return
+
+            session = self.db_manager.get_session()
+            trade = session.query(Trade).filter_by(id=trade_id).first()
+
+            if not trade or trade.status != TradeStatusEnum.OPEN:
+                session.close()
+                return
+
+            # Update highest/lowest
+            if candle['high'] > trade.highest_price:
+                trade.highest_price = candle['high']
+            if candle['low'] < trade.lowest_price:
+                trade.lowest_price = candle['low']
+
+            # Calculate new TP
+            if symbol in self.trade_reduce_info:
+                new_tp = self._calculate_reduced_tp(trade, symbol)
+
+                if new_tp != trade.take_profit:
+                    old_tp = trade.take_profit
+                    trade.take_profit = new_tp
+                    session.commit()
+
+                    # Update TP on exchange
+                    if self.trade_client:
+                        await self._update_exchange_tp(symbol, trade, new_tp)
+
+                    self.log.i(self.tag, f"📉 Reduced TP for {symbol}: ${old_tp:.6f} → ${new_tp:.6f}")
+
+            session.close()
+
+        except Exception as e:
+            self.log.e(self.tag, f"Error updating real trade TP: {e}")
+
+    async def _update_exchange_tp(self, symbol: str, trade: Trade, new_tp: float):
+        """Update TP order trên exchange"""
+        try:
+            if not self.trade_client:
+                return
+
+            # Cancel old TP order nếu có
+            order_info = self.exchange_orders.get(symbol, {})
+            old_tp_order_id = order_info.get('tp_order_id')
+
+            if old_tp_order_id:
+                await self.trade_client.send_order(orderId=old_tp_order_id)  # Cancel
+
+            # Place new TP order
+            from x1.bot.exchange.trade.trade_side import TradeSide
+
+            if self.direction == DirectionEnum.LONG:
+                side = TradeSide.CLOSE_LONG
+            else:
+                side = TradeSide.CLOSE_SHORT
+
+            new_order_id = await self.trade_client.send_order(
+                orderId=-1,
+                symbol=symbol,
+                price=new_tp,
+                quantity=0,  # auto_size
+                side=side,
+                take_profit=new_tp,
+                tag=f"TP-Update-{self.bot_name}"
+            )
+
+            if new_order_id and new_order_id > 0:
+                self.exchange_orders[symbol]['tp_order_id'] = new_order_id
+
+        except Exception as e:
+            self.log.e(self.tag, f"Error updating exchange TP: {e}")
 
     async def check_pending_order(self, symbol: str, candle: Dict):
         """Check pending order (SIMULATED mode)"""
@@ -408,7 +646,7 @@ class TradingBot:
             self.log.e(self.tag, f"Error checking pending order: {e}")
 
     async def check_exit(self, symbol: str, candle: Dict):
-        """Check exit conditions với Reduce TP"""
+        """Check exit conditions với Reduce TP (SIMULATED mode)"""
         try:
             trade_id = self.active_trades.get(symbol)
             if not trade_id:
@@ -420,9 +658,6 @@ class TradingBot:
             if not trade or trade.status != TradeStatusEnum.OPEN:
                 session.close()
                 return
-
-            # Lưu TP ban đầu để so sánh
-            initial_tp = trade.take_profit
 
             # Update highest/lowest
             if candle['high'] > trade.highest_price:
@@ -474,11 +709,6 @@ class TradingBot:
     def _calculate_reduced_tp(self, trade: Trade, symbol: str) -> float:
         """
         Tính TP mới sau khi apply reduce
-
-        Logic:
-        - Mỗi phút, TP giảm reduce% của tổng khoảng cách (TP → Entry → SL)
-        - LONG: TP giảm từ trên xuống
-        - SHORT: TP tăng từ dưới lên (về phía SL)
         """
         reduce_info = self.trade_reduce_info.get(symbol)
         if not reduce_info:
@@ -500,35 +730,25 @@ class TradingBot:
         stop_loss = trade.stop_loss
 
         if self.direction == DirectionEnum.LONG:
-            # LONG: TP > Entry > SL
-            tp_distance = initial_tp - entry_price  # Dương
-            sl_distance = entry_price - stop_loss  # Dương
+            tp_distance = initial_tp - entry_price
+            sl_distance = entry_price - stop_loss
             total_distance = tp_distance + sl_distance
 
-            # Mỗi phút giảm reduce% của total_distance
             reduction_per_minute = total_distance * (self.reduce / 100)
             total_reduction = reduction_per_minute * minutes_held
 
-            # TP mới = Initial TP - total_reduction
             new_tp = initial_tp - total_reduction
-
-            # Không cho TP thấp hơn SL
             new_tp = max(new_tp, stop_loss)
 
         else:  # SHORT
-            # SHORT: SL > Entry > TP
-            tp_distance = entry_price - initial_tp  # Dương (TP < Entry)
-            sl_distance = stop_loss - entry_price  # Dương (SL > Entry)
+            tp_distance = entry_price - initial_tp
+            sl_distance = stop_loss - entry_price
             total_distance = tp_distance + sl_distance
 
-            # Mỗi phút giảm reduce%
             reduction_per_minute = total_distance * (self.reduce / 100)
             total_reduction = reduction_per_minute * minutes_held
 
-            # TP mới = Initial TP + total_reduction (tăng về phía SL)
             new_tp = initial_tp + total_reduction
-
-            # Không cho TP cao hơn SL
             new_tp = min(new_tp, stop_loss)
 
         return new_tp
@@ -612,22 +832,19 @@ class TradingBot:
                 mode_emoji = "🔵"
                 mode_text = "SIM"
 
-            # WIN/LOSS dựa trên PnL thực tế
             result_emoji = "✅" if pnl_usdt > 0 else "❌"
             result_text = "WIN" if pnl_usdt > 0 else "LOSS"
 
-            # Reason emoji và text
             if 'TP' in reason:
                 reason_emoji = "🎯"
                 if '_REDUCED' in reason:
                     reason_text = f"Take Profit (Reduced after {hold_minutes:.0f}min)"
                 else:
                     reason_text = "Take Profit"
-            else:  # SL
+            else:
                 reason_emoji = "🛑"
                 reason_text = "Stop Loss"
 
-            # Reduce info
             reduce_str = f"⏱️ Reduce: {self.reduce}%/min\n" if self.reduce > 0 else ""
 
             message = (
@@ -678,6 +895,9 @@ class TradingBot:
 
                 if trade.symbol in self.trade_reduce_info:
                     del self.trade_reduce_info[trade.symbol]
+
+                if trade.symbol in self.exchange_orders:
+                    del self.exchange_orders[trade.symbol]
 
                 self.log.i(self.tag, f"Cancelled trade {trade_id}: {reason}")
 

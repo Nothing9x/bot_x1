@@ -29,6 +29,8 @@ def migrate(db_path='trading_bot.db'):
         ("api_secret", "VARCHAR(200)"),
         ("source_bot_id", "INTEGER"),
         ("chat_id", "VARCHAR(100)"),
+        ("proxy", "VARCHAR(200)"),  # ← NEW
+        ("leverage", "INTEGER DEFAULT 20"),  # ← NEW
     ]
 
     added = 0

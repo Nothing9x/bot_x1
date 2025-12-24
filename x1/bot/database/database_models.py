@@ -80,9 +80,11 @@ class BotConfig(Base):
     # ✨ NEW: Real Bot specific fields
     is_real_bot = Column(Boolean, default=False)  # True nếu là bot load từ config file
     account_name = Column(String(100), nullable=True)  # Tên account (link với file config)
-    api_key = Column(String(200), nullable=True)  # API Key (encrypted)
-    api_secret = Column(String(200), nullable=True)  # API Secret (encrypted)
+    api_key = Column(String(200), nullable=True)  # API Key
+    api_secret = Column(String(200), nullable=True)  # API Secret
     chat_id = Column(String(100), nullable=True)  # Chat ID riêng cho real bot notifications
+    proxy = Column(String(200), nullable=True)  # Proxy cho API calls
+    leverage = Column(Integer, default=20)  # Leverage cho trading
 
     # ✨ NEW: Link tới source bot (simulated bot mà real bot copy config từ đó)
     source_bot_id = Column(Integer, ForeignKey('bot_configs.id'), nullable=True)
